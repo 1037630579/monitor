@@ -233,14 +233,14 @@ def build_tools(config: AppConfig) -> list:
             return {"content": [{"type": "text", "text": result}]}
 
         # ── VPN ──
-        @tool("aws_list_vpn", "列出 AWS VPN 连接列表，包含隧道状态。account: 账户名(空=所有账户)", {"account": str})
+        @tool("aws_list_vpn", "列出 AWS VPN 连接并自动查询每个VPN最近1小时的带宽数据（1分钟粒度表格）。account: 账户名(空=所有账户)", {"account": str})
         async def aws_list_vpn_tool(args: dict[str, Any]) -> dict[str, Any]:
             result = _run_for_accounts(args.get("account", ""), list_vpn_connections_aws)
             return {"content": [{"type": "text", "text": result}]}
 
         @tool(
             "aws_vpn_status",
-            "查询 AWS VPN 详细状态：隧道UP/DOWN、总流量、平均速率(Mb/s)、峰值速率、趋势。account: 账户名(空=默认)。vpn_id 可选。hours 默认1小时，period 固定60秒",
+            "查询 AWS VPN 带宽使用情况：隧道状态 + 最新采样点 + 每分钟带宽趋势表格(Mbps) + 小结。默认最近1小时、每1分钟一个点(hours=1, period=60)。account: 账户名(空=默认)。vpn_id: 可选指定VPN",
             {"account": str, "vpn_id": str, "hours": float, "period": int},
         )
         async def aws_vpn_status_tool(args: dict[str, Any]) -> dict[str, Any]:
@@ -322,7 +322,7 @@ AWS 独有工具：aws_list_accounts, aws_idle_ec2, aws_list_vpn, aws_vpn_status
 - 查对象存储 → 调用 *_list_oss / *_list_obs / aws_list_s3
 - 查 CDN → 调用 *_list_cdn / aws_list_cloudfront
 - 查闲置资源 → 优先 aws_idle_ec2（自动检测停止+低CPU实例）
-- 查 VPN → aws_list_vpn + aws_vpn_status
+- 查 VPN → 调用 aws_list_vpn（自动列出所有VPN并查询每个VPN最近1小时每1分钟的带宽表格）。查特定VPN或自定义时间范围时用 aws_vpn_status
 - 查 ALB → aws_list_elb + aws_get_metric_data
 
 # AWS 多账户与多区域
@@ -407,19 +407,20 @@ ECS 实例（按需，小时价 → 月估）：
 
 # 输出规范
 
-1. 始终用中文回答，数据必须附带单位
+1. 只能用中文回答，不能使用其他语言，数据必须附带单位
 2. 多云结果按平台分段展示，标注平台名称
 3. 已停止的实例和已禁用/停用的 CDN 必须逐条列出完整详情（ID、名称、类型、区域、停止时长等），禁止省略或合并
-4. **成本标注**：对每个资源标注预估月度成本；对已停止但仍产生费用的资源（如 EBS 存储、弹性 IP）单独标注持续费用
-5. 主动告警：VPN 隧道 DOWN、ALB 5xx 错误、不健康主机
-6. **成本优化建议**：在输出末尾增加「💰 成本优化建议」段落，包含：
+4. **VPN 带宽数据**：工具返回的带宽趋势表格（每分钟一行）必须完整原样输出，禁止省略、合并或只输出小结。对有流量的 VPN，输出顺序为：最新采样点表格 → 每分钟趋势表格（全部行） → 小结。对无流量的 VPN（所有隧道 DOWN），只需简要说明即可
+5. **成本标注**：对每个资源标注预估月度成本；对已停止但仍产生费用的资源（如 EBS 存储、弹性 IP）单独标注持续费用
+6. 主动告警：VPN 隧道 DOWN、ALB 5xx 错误、不健康主机
+7. **成本优化建议**：在输出末尾增加「💰 成本优化建议」段落，包含：
    - 已停止实例：列出仍在产生的存储/IP 费用，建议释放或创建快照后删除磁盘
    - 低利用率实例（CPU<5%）：建议缩容到更小规格，估算节省金额
    - 闲置存储桶：建议转为低频/归档存储类型，估算节省比例
    - 禁用 CDN：建议删除无用分发，避免配置残留
    - 未使用的弹性 IP / NAT 网关：建议释放
    - 给出**月度预估可节省总金额**
-7. 查询失败时说明原因并给出排查建议
+8. 查询失败时说明原因并给出排查建议
 """
 
 

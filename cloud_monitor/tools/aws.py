@@ -213,7 +213,7 @@ def get_metric_data_aws(
 # ──────────────── VPN 工具 ────────────────
 
 def list_vpn_connections_aws(config: AWSAccountConfig) -> str:
-    """列出 AWS VPN 连接"""
+    """列出 AWS VPN 连接，并自动查询每个 VPN 最近1小时每1分钟的带宽数据"""
     label = _account_label(config)
     try:
         region = config.get_vpn_region()
@@ -226,43 +226,11 @@ def list_vpn_connections_aws(config: AWSAccountConfig) -> str:
 
         results = []
         for vpn in vpns:
-            name = ""
-            for tag in vpn.get("Tags", []):
-                if tag["Key"] == "Name":
-                    name = tag["Value"]
-                    break
-
-            tunnels_info = []
-            for i, tunnel in enumerate(vpn.get("VgwTelemetry", [])):
-                status = tunnel.get("Status", "未知")
-                outside_ip = tunnel.get("OutsideIpAddress", "")
-                accepted = tunnel.get("AcceptedRouteCount", 0)
-                tunnels_info.append(
-                    f"    隧道{i+1}: 状态={status}, 外部IP={outside_ip}, 路由数={accepted}"
-                )
-
-            extra = {
-                "类型": vpn.get("Type", ""),
-                "客户网关": vpn.get("CustomerGatewayId", ""),
-                "虚拟专用网关": vpn.get("VpnGatewayId", ""),
-                "类别": vpn.get("Category", ""),
-            }
-
-            info = InstanceInfo(
-                cloud="AWS",
-                instance_id=vpn["VpnConnectionId"],
-                instance_name=name,
-                instance_type="VPN Connection",
-                status=vpn.get("State", ""),
-                region=region,
-                extra=extra,
-            )
-            detail = info.display()
-            if tunnels_info:
-                detail += "\n  隧道详情:\n" + "\n".join(tunnels_info)
+            vpn_id = vpn["VpnConnectionId"]
+            detail = get_vpn_status_aws(config, vpn_id=vpn_id, hours=1, period=60)
             results.append(detail)
 
-        return f"{label}在区域 {region} 找到 {len(results)} 个 VPN 连接:\n\n" + "\n\n".join(results)
+        return f"{label}在区域 {region} 找到 {len(vpns)} 个 VPN 连接:\n\n" + "\n\n".join(results)
     except Exception as e:
         return f"{label}AWS 查询 VPN 连接失败: {e}\n{traceback.format_exc()}"
 
@@ -291,7 +259,7 @@ def _format_rate(bytes_per_sec: float) -> str:
 
 
 def get_vpn_status_aws(config: AWSAccountConfig, vpn_id: str = "", hours: float = 1, period: int = 60) -> str:
-    """查询 AWS VPN 连接的详细状态、时间段总流量和每秒速率"""
+    """查询 AWS VPN 带宽使用情况：最新采样点 + 时间趋势表格 + 小结"""
     label = _account_label(config)
     try:
         region = config.get_vpn_region()
@@ -310,8 +278,11 @@ def get_vpn_status_aws(config: AWSAccountConfig, vpn_id: str = "", hours: float 
 
         now = datetime.now(timezone.utc)
         start = now - timedelta(hours=hours)
-        total_seconds = hours * 3600
         time_label = f"{hours:.0f}小时" if hours >= 1 else f"{hours * 60:.0f}分钟"
+
+        display_period = period
+        interval_label = f"{display_period // 60} 分钟" if display_period >= 60 else f"{display_period} 秒"
+
         results = []
 
         for vpn in vpns:
@@ -324,25 +295,18 @@ def get_vpn_status_aws(config: AWSAccountConfig, vpn_id: str = "", hours: float 
 
             lines = [f"━━━ {label}VPN: {vpn_conn_id}" + (f" ({name})" if name else "") + f" [区域: {region}] ━━━"]
             lines.append(f"  连接状态: {vpn.get('State', '未知')}")
-            lines.append(f"  类型: {vpn.get('Type', '')}")
             lines.append(f"  客户网关: {vpn.get('CustomerGatewayId', '')}")
-            lines.append(f"  虚拟专用网关: {vpn.get('VpnGatewayId', '')}")
+            lines.append(f"  虚拟专用网关: {vpn.get('VpnGatewayId', '') or vpn.get('TransitGatewayId', '')}")
 
             for i, tunnel in enumerate(vpn.get("VgwTelemetry", [])):
                 status = tunnel.get("Status", "未知")
                 status_icon = "🟢" if status == "UP" else "🔴"
-                lines.append(f"\n  {status_icon} 隧道 {i+1}:")
-                lines.append(f"    状态: {status}")
-                lines.append(f"    外部IP: {tunnel.get('OutsideIpAddress', '')}")
-                lines.append(f"    最后状态变更: {tunnel.get('LastStatusChange', '')}")
-                lines.append(f"    接受路由数: {tunnel.get('AcceptedRouteCount', 0)}")
-                detail_msg = tunnel.get("StatusMessage", "")
-                if detail_msg:
-                    lines.append(f"    状态消息: {detail_msg}")
+                lines.append(f"\n  {status_icon} 隧道 {i+1}: {status}  外部IP: {tunnel.get('OutsideIpAddress', '')}  路由数: {tunnel.get('AcceptedRouteCount', 0)}")
 
-            lines.append(f"\n  📊 流量统计 (最近{time_label}, 周期{period}s):")
+            in_data: list[dict] = []
+            out_data: list[dict] = []
 
-            for metric, metric_label in [("TunnelDataIn", "入站"), ("TunnelDataOut", "出站")]:
+            for metric, storage in [("TunnelDataIn", in_data), ("TunnelDataOut", out_data)]:
                 try:
                     resp = cw.get_metric_statistics(
                         Namespace="AWS/VPN",
@@ -350,35 +314,79 @@ def get_vpn_status_aws(config: AWSAccountConfig, vpn_id: str = "", hours: float 
                         Dimensions=[{"Name": "VpnId", "Value": vpn_conn_id}],
                         StartTime=start,
                         EndTime=now,
-                        Period=period,
+                        Period=display_period,
                         Statistics=["Sum"],
                     )
                     dps = resp.get("Datapoints", [])
                     if dps:
                         sorted_dps = sorted(dps, key=lambda x: x["Timestamp"])
-                        total_bytes = sum(dp.get("Sum", 0) for dp in sorted_dps)
-                        avg_rate = total_bytes / total_seconds
-                        per_period = [dp.get("Sum", 0) for dp in sorted_dps]
-                        peak_bytes = max(per_period)
-                        peak_rate = peak_bytes / period
-
-                        lines.append(f"    {metric_label}总流量: {_format_bytes(total_bytes)}")
-                        lines.append(f"    {metric_label}平均速率: {_format_rate(avg_rate)}")
-                        lines.append(f"    {metric_label}峰值速率: {_format_rate(peak_rate)} ")
-
-                        recent = sorted_dps[-6:]
-                        trend_parts = []
-                        for dp in recent:
+                        for dp in sorted_dps:
                             ts = dp["Timestamp"]
                             if ts.tzinfo is None:
                                 ts = ts.replace(tzinfo=timezone.utc)
-                            rate = dp.get("Sum", 0) / period
-                            trend_parts.append(f"{ts.strftime('%H:%M')}={_format_rate(rate)}")
-                        lines.append(f"    {metric_label}速率趋势: {' → '.join(trend_parts)}")
-                    else:
-                        lines.append(f"    {metric_label}流量: 无数据")
-                except Exception as exc:
-                    lines.append(f"    {metric_label}流量: 查询失败 ({exc})")
+                            rate_bytes = dp.get("Sum", 0) / display_period
+                            rate_mbps = rate_bytes * 8 / 1_000_000
+                            storage.append({"ts": ts, "mbps": rate_mbps, "bytes": dp.get("Sum", 0)})
+                except Exception:
+                    pass
+
+            if in_data or out_data:
+                latest_in = in_data[-1]["mbps"] if in_data else 0
+                latest_out = out_data[-1]["mbps"] if out_data else 0
+                lines.append(f"\n  ## 最新采样点")
+                lines.append(f"  | 方向 | 带宽 |")
+                lines.append(f"  |------|------|")
+                lines.append(f"  | 入方向 (rx) | {latest_in:.1f} Mbps |")
+                lines.append(f"  | 出方向 (tx) | {latest_out:.1f} Mbps |")
+
+                ts_set: dict[str, dict] = {}
+                for dp in in_data:
+                    key = dp["ts"].strftime("%H:%M")
+                    ts_set.setdefault(key, {"in": 0, "out": 0})
+                    ts_set[key]["in"] = dp["mbps"]
+                for dp in out_data:
+                    key = dp["ts"].strftime("%H:%M")
+                    ts_set.setdefault(key, {"in": 0, "out": 0})
+                    ts_set[key]["out"] = dp["mbps"]
+
+                sorted_times = sorted(ts_set.keys())
+
+                lines.append(f"\n  ## 最近 {time_label} 趋势（{interval_label}粒度）")
+                lines.append(f"  | 时间 (UTC) | 入方向 (Mbps) | 出方向 (Mbps) |")
+                lines.append(f"  |------------|---------------|---------------|")
+                for t in sorted_times:
+                    v = ts_set[t]
+                    lines.append(f"  | {t} | {v['in']:.1f} | {v['out']:.1f} |")
+
+                in_rates = [d["mbps"] for d in in_data] if in_data else [0]
+                out_rates = [d["mbps"] for d in out_data] if out_data else [0]
+                in_avg = sum(in_rates) / len(in_rates)
+                out_avg = sum(out_rates) / len(out_rates)
+                in_peak = max(in_rates)
+                out_peak = max(out_rates)
+                in_min = min(in_rates)
+                out_min = min(out_rates)
+
+                total_in_bytes = sum(d["bytes"] for d in in_data)
+                total_out_bytes = sum(d["bytes"] for d in out_data)
+
+                lines.append(f"\n  ## 小结")
+                lines.append(f"  - 入方向带宽：最近{time_label}在 {in_min:.1f}~{in_peak:.1f} Mbps 之间，平均 {in_avg:.1f} Mbps，总流量 {_format_bytes(total_in_bytes)}")
+                lines.append(f"  - 出方向带宽：最近{time_label}在 {out_min:.1f}~{out_peak:.1f} Mbps 之间，平均 {out_avg:.1f} Mbps，总流量 {_format_bytes(total_out_bytes)}")
+
+                if out_avg > in_avg * 1.5:
+                    lines.append(f"  - 出方向流量是入方向的 {out_avg / in_avg:.1f} 倍，数据主要从本端向对端传输")
+                elif in_avg > out_avg * 1.5:
+                    lines.append(f"  - 入方向流量是出方向的 {in_avg / out_avg:.1f} 倍，数据主要从对端向本端传输")
+                else:
+                    lines.append(f"  - 入出方向流量相对均衡")
+
+                if in_peak > 800 or out_peak > 800:
+                    lines.append(f"  - ⚠️ 峰值带宽已超过 800 Mbps，接近 1000M 规格上限，建议关注")
+                elif in_peak > 500 or out_peak > 500:
+                    lines.append(f"  - 带宽使用率中等，峰值达到网关规格的 {max(in_peak, out_peak) / 10:.0f}%")
+            else:
+                lines.append(f"\n  📊 最近{time_label}无流量数据")
 
             results.append("\n".join(lines))
 
