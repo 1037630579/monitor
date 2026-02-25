@@ -1,0 +1,50 @@
+# 多云监控配置文件
+# 复制此文件为 config.yaml 并填入实际的云平台凭证
+
+huawei:
+  enabled: false
+  ak: "your-huawei-access-key"
+  sk: "your-huawei-secret-key"
+  project_id: "your-project-id"
+  region: "cn-north-4"
+
+aliyun:
+  enabled: false
+  access_key_id: "your-aliyun-access-key-id"
+  access_key_secret: "your-aliyun-access-key-secret"
+  region_id: "cn-hangzhou"
+
+# ── AWS 配置 ──
+# 方式一：单账户（向后兼容）
+# aws:
+#   enabled: true
+#   access_key_id: "xxxxxxxxxxxxxxxxxxxx"
+#   secret_access_key: "xxxxxxxxxxxxxxxxxxxx+xxxxxxxxxxxxxxxxxxxx"
+#   region: "us-east-1"
+#   vpn_region: "ap-southeast-1"    # VPN 专用区域
+#   elb_region: "us-west-2"         # ALB 专用区域
+
+# 方式二：多账户 + 多区域
+aws:
+  enabled: true
+  accounts:
+    - name: "production"
+      access_key_id: "xxxxxxxxxxxxxxxxxxxx"
+      secret_access_key: "xxxxxxxxxxxxxxxxxxxx"
+      region: "us-east-2"             # 默认区域
+      regions:                         # EC2 等区域性服务会遍历这些区域
+        - "us-east-2"
+        - "us-west-2"
+        - "ap-southeast-1"
+      vpn_region: "ap-southeast-1"     # VPN 连接所在区域
+      elb_region: "us-west-2"         # ALB 所在区域
+
+    - name: "staging"
+      access_key_id: "your-staging-access-key-id"
+      secret_access_key: "your-staging-secret-access-key"
+      region: "us-east-1"
+      # 不配 regions 则只查 region 指定的单区域
+
+webhook:
+  enabled: false
+  url: "https://your-webhook-url"
