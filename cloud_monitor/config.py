@@ -95,6 +95,23 @@ class MySQLConfig:
 
 
 @dataclass
+class TaskSchedule:
+    """单个定时任务配置"""
+    enabled: bool = True
+    interval_hours: int = 168
+    params: dict = field(default_factory=dict)
+
+
+@dataclass
+class ScheduleConfig:
+    """定时巡检配置"""
+    enabled: bool = False
+    run_on_startup: bool = True
+    aws_ec2: TaskSchedule = field(default_factory=TaskSchedule)
+    huawei_checks: dict[str, TaskSchedule] = field(default_factory=dict)
+
+
+@dataclass
 class AppConfig:
     huawei: HuaweiCloudConfig = field(default_factory=HuaweiCloudConfig)
     aliyun: AliyunConfig = field(default_factory=AliyunConfig)
@@ -102,6 +119,7 @@ class AppConfig:
     webhook: WebhookConfig = field(default_factory=WebhookConfig)
     ec2_check: EC2CheckConfig = field(default_factory=EC2CheckConfig)
     mysql: MySQLConfig = field(default_factory=MySQLConfig)
+    schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
 
     def enabled_clouds(self) -> list[str]:
         clouds = []
@@ -199,6 +217,32 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
                 user=my.get("user", "root"),
                 password=my.get("password", ""),
                 db_name=my.get("db_name", "cloud_monitor"),
+            )
+
+        sch = data.get("schedule", {})
+        if sch:
+            aws_ec2_raw = sch.get("aws_ec2", {})
+            aws_ec2_task = TaskSchedule(
+                enabled=aws_ec2_raw.get("enabled", True),
+                interval_hours=int(aws_ec2_raw.get("interval_hours", 168)),
+            )
+
+            huawei_tasks: dict[str, TaskSchedule] = {}
+            for check_type, check_cfg in sch.get("huawei_checks", {}).items():
+                if isinstance(check_cfg, dict):
+                    params = {k: v for k, v in check_cfg.items()
+                              if k not in ("enabled", "interval_hours")}
+                    huawei_tasks[check_type] = TaskSchedule(
+                        enabled=check_cfg.get("enabled", True),
+                        interval_hours=int(check_cfg.get("interval_hours", 168)),
+                        params=params,
+                    )
+
+            cfg.schedule = ScheduleConfig(
+                enabled=sch.get("enabled", False),
+                run_on_startup=sch.get("run_on_startup", True),
+                aws_ec2=aws_ec2_task,
+                huawei_checks=huawei_tasks,
             )
 
     # 环境变量覆盖
