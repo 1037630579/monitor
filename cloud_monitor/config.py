@@ -75,11 +75,21 @@ class WebhookConfig:
 
 
 @dataclass
+class EC2CheckConfig:
+    """EC2 闲置检测参数"""
+    cpu_threshold: float = 10.0
+    mem_threshold: float = 10.0
+    hours: float = 360
+    max_workers: int = 20
+
+
+@dataclass
 class AppConfig:
     huawei: HuaweiCloudConfig = field(default_factory=HuaweiCloudConfig)
     aliyun: AliyunConfig = field(default_factory=AliyunConfig)
     aws: AWSConfig = field(default_factory=AWSConfig)
     webhook: WebhookConfig = field(default_factory=WebhookConfig)
+    ec2_check: EC2CheckConfig = field(default_factory=EC2CheckConfig)
 
     def enabled_clouds(self) -> list[str]:
         clouds = []
@@ -158,6 +168,15 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
             enabled=wh.get("enabled", False),
             url=wh.get("url", ""),
         )
+
+        ec2 = data.get("ec2_check", {})
+        if ec2:
+            cfg.ec2_check = EC2CheckConfig(
+                cpu_threshold=float(ec2.get("cpu_threshold", 10.0)),
+                mem_threshold=float(ec2.get("mem_threshold", 10.0)),
+                hours=float(ec2.get("hours", 360)),
+                max_workers=int(ec2.get("max_workers", 20)),
+            )
 
     # 环境变量覆盖
     if v := _env_override("HUAWEI_AK"):

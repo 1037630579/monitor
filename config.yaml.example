@@ -45,6 +45,13 @@ aws:
       region: "us-east-1"
       # 不配 regions 则只查 region 指定的单区域
 
+# EC2 闲置检测参数（--ec2 和 Agent 查询共用）
+ec2_check:
+  cpu_threshold: 10.0       # CPU 利用率阈值 %
+  mem_threshold: 10.0       # 内存利用率阈值 %（需 CloudWatch Agent）
+  hours: 360                # 检测时间窗口（小时，360=15天）
+  max_workers: 20           # CloudWatch 并发查询线程数
+
 webhook:
   enabled: false
   url: "https://your-webhook-url"

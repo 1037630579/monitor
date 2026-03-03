@@ -1,6 +1,8 @@
 """AWS CloudWatch 监控工具 - 支持多账户多区域"""
 
+import sys
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -395,31 +397,115 @@ def get_vpn_status_aws(config: AWSAccountConfig, vpn_id: str = "", hours: float 
         return f"{label}AWS 查询 VPN 状态失败: {e}\n{traceback.format_exc()}"
 
 
-# ──────────────── EC2 云主机（支持多区域）────────────────
+# ──────────────── EC2 云主机（统一工具：概览 + 停止实例 + 低利用率检测）────────────────
 
-def list_ec2_instances_aws(config: AWSAccountConfig, region: str = "") -> str:
-    """列出 AWS EC2 实例概览：按区域统计总数和运行/停止数，仅输出已停止实例的详情"""
+# 缓存：检测结果（header_text, stopped_details, low_util_details）
+_ec2_scan_cache: dict[str, tuple[str, list[str], list[str]]] = {}
+
+
+def _ec2_cache_key(config: AWSAccountConfig, region: str,
+                   cpu_threshold: float, mem_threshold: float, hours: float) -> str:
+    return f"{config.name}|{region}|{cpu_threshold}|{mem_threshold}|{hours}"
+
+
+def ec2_clear_cache():
+    """清空 EC2 检测缓存"""
+    _ec2_scan_cache.clear()
+
+
+def _check_instance_utilization(
+    config: AWSAccountConfig,
+    inst_id: str,
+    region: str,
+    hours: float,
+    cpu_threshold: float,
+    mem_threshold: float,
+) -> dict | None:
+    """查询单个实例的 CPU 和内存利用率，返回低利用率信息或 None"""
+    cw = _get_client(config, region=region)
+    now_utc = datetime.now(timezone.utc)
+    start = now_utc - timedelta(hours=hours)
+    time_label = f"{hours/24:.0f}天" if hours >= 48 else f"{hours:.0f}h"
+
+    result: dict[str, str] = {}
+    is_idle = False
+
+    try:
+        resp = cw.get_metric_statistics(
+            Namespace="AWS/EC2", MetricName="CPUUtilization",
+            Dimensions=[{"Name": "InstanceId", "Value": inst_id}],
+            StartTime=start, EndTime=now_utc,
+            Period=3600, Statistics=["Average"],
+        )
+        dps = resp.get("Datapoints", [])
+        if dps:
+            avg_cpu = sum(dp.get("Average", 0) for dp in dps) / len(dps)
+            max_cpu = max(dp.get("Average", 0) for dp in dps)
+            result["avg_cpu"] = f"{avg_cpu:.1f}%"
+            result["max_cpu"] = f"{max_cpu:.1f}%"
+            if avg_cpu < cpu_threshold:
+                is_idle = True
+    except Exception:
+        pass
+
+    try:
+        resp = cw.get_metric_statistics(
+            Namespace="CWAgent", MetricName="mem_used_percent",
+            Dimensions=[{"Name": "InstanceId", "Value": inst_id}],
+            StartTime=start, EndTime=now_utc,
+            Period=3600, Statistics=["Average"],
+        )
+        dps = resp.get("Datapoints", [])
+        if dps:
+            avg_mem = sum(dp.get("Average", 0) for dp in dps) / len(dps)
+            max_mem = max(dp.get("Average", 0) for dp in dps)
+            result["avg_mem"] = f"{avg_mem:.1f}%"
+            result["max_mem"] = f"{max_mem:.1f}%"
+            if avg_mem < mem_threshold:
+                is_idle = True
+    except Exception:
+        pass
+
+    if is_idle:
+        return result
+    return None
+
+
+def _run_ec2_scan(
+    config: AWSAccountConfig,
+    region: str,
+    cpu_threshold: float,
+    mem_threshold: float,
+    hours: float,
+    max_workers: int,
+) -> tuple[str, list[str], list[str]]:
+    """执行完整的 EC2 检测扫描，返回 (header_text, stopped_details, low_util_details)"""
     label = _account_label(config)
     query_regions = [region] if region else config.get_regions()
 
     region_stats: dict[str, dict[str, int]] = {}
     stopped_details: list[str] = []
     total = 0
+    running_count = 0
+
+    days = hours / 24
+    time_desc = f"{days:.0f}天" if hours >= 48 else f"{hours:.0f}小时"
+
+    running_instances: list[tuple[str, str, str, str, dict, list]] = []
 
     for r in query_regions:
         stats = {"running": 0, "stopped": 0, "other": 0}
         try:
-            client = _get_client(config, service="ec2", region=r)
-            response = client.describe_instances()
-            for reservation in response.get("Reservations", []):
-                for inst in reservation.get("Instances", []):
-                    state = inst.get("State", {}).get("Name", "")
-                    total += 1
+            ec2 = _get_client(config, service="ec2", region=r)
+            paginator = ec2.get_paginator("describe_instances")
+            for pg in paginator.paginate():
+                for reservation in pg.get("Reservations", []):
+                    for inst in reservation.get("Instances", []):
+                        state = inst.get("State", {}).get("Name", "")
+                        inst_id = inst["InstanceId"]
+                        inst_type = inst.get("InstanceType", "")
+                        total += 1
 
-                    if state == "running":
-                        stats["running"] += 1
-                    elif state == "stopped":
-                        stats["stopped"] += 1
                         name = ""
                         tags_list = []
                         for tag in inst.get("Tags", []):
@@ -428,184 +514,159 @@ def list_ec2_instances_aws(config: AWSAccountConfig, region: str = "") -> str:
                             else:
                                 tags_list.append(f"{tag['Key']}={tag['Value']}")
 
-                        extra: dict[str, str] = {
-                            "区域": r,
+                        base_info: dict[str, str] = {
                             "可用区": inst.get("Placement", {}).get("AvailabilityZone", ""),
-                            "实例类型": inst.get("InstanceType", ""),
                             "私有IP": inst.get("PrivateIpAddress", ""),
                             "公网IP": inst.get("PublicIpAddress", "无"),
                         }
 
-                        launch_time = inst.get("LaunchTime", "")
-                        if hasattr(launch_time, "strftime"):
-                            extra["最后启动"] = launch_time.strftime("%Y-%m-%d %H:%M")
-                            now = datetime.now(timezone.utc)
-                            lt = launch_time if launch_time.tzinfo else launch_time.replace(tzinfo=timezone.utc)
-                            days = (now - lt).days
-                            if days > 365:
-                                extra["距今"] = f"{days // 365}年{days % 365}天"
-                            else:
-                                extra["距今"] = f"{days}天"
+                        if state == "stopped":
+                            stats["stopped"] += 1
+                            launch_time = inst.get("LaunchTime", "")
+                            if hasattr(launch_time, "strftime"):
+                                base_info["最后启动"] = launch_time.strftime("%Y-%m-%d %H:%M")
+                                now_utc = datetime.now(timezone.utc)
+                                lt = launch_time if launch_time.tzinfo else launch_time.replace(tzinfo=timezone.utc)
+                                d = (now_utc - lt).days
+                                base_info["距今"] = f"{d // 365}年{d % 365}天" if d > 365 else f"{d}天"
 
-                        reason = inst.get("StateTransitionReason", "")
-                        if reason:
-                            extra["停止原因"] = reason
+                            reason = inst.get("StateTransitionReason", "")
+                            if reason:
+                                base_info["停止原因"] = reason
 
-                        # EBS 卷
-                        volumes = inst.get("BlockDeviceMappings", [])
-                        if volumes:
-                            vol_ids = [v.get("Ebs", {}).get("VolumeId", "") for v in volumes if v.get("Ebs")]
-                            extra["EBS卷"] = ", ".join(vol_ids) if vol_ids else "无"
-                            extra["EBS卷数"] = str(len(vol_ids))
+                            volumes = inst.get("BlockDeviceMappings", [])
+                            if volumes:
+                                vol_ids = [v.get("Ebs", {}).get("VolumeId", "") for v in volumes if v.get("Ebs")]
+                                base_info["EBS卷"] = ", ".join(vol_ids) if vol_ids else "无"
+                                base_info["EBS卷数"] = str(len(vol_ids))
 
-                        # 安全组
-                        sgs = inst.get("SecurityGroups", [])
-                        if sgs:
-                            extra["安全组"] = ", ".join(f"{sg.get('GroupName', '')}({sg.get('GroupId', '')})" for sg in sgs[:3])
+                            sgs = inst.get("SecurityGroups", [])
+                            if sgs:
+                                base_info["安全组"] = ", ".join(
+                                    f"{sg.get('GroupName', '')}({sg.get('GroupId', '')})" for sg in sgs[:3]
+                                )
 
-                        # 标签
-                        if tags_list:
-                            extra["标签"] = ", ".join(tags_list[:5])
+                            if tags_list:
+                                base_info["标签"] = ", ".join(tags_list[:5])
 
-                        info = InstanceInfo(
-                            cloud="AWS", instance_id=inst["InstanceId"], instance_name=name,
-                            instance_type=inst.get("InstanceType", ""),
-                            status="🔴 stopped", region=r, extra=extra,
-                        )
-                        stopped_details.append(info.display())
-                    else:
-                        stats["other"] += 1
+                            info = InstanceInfo(
+                                cloud="AWS", instance_id=inst_id, instance_name=name,
+                                instance_type=inst_type, status="🔴 已停止", region=r,
+                                extra=base_info,
+                            )
+                            stopped_details.append(info.display())
+                            continue
+
+                        if state != "running":
+                            stats["other"] += 1
+                            continue
+
+                        stats["running"] += 1
+                        running_count += 1
+                        running_instances.append((inst_id, name, inst_type, r, base_info, tags_list))
+
         except Exception as e:
             stopped_details.append(f"区域 {r} 查询失败: {e}")
 
         region_stats[r] = stats
 
     region_desc = ", ".join(query_regions)
-    if total == 0:
-        return f"{label}AWS 区域 [{region_desc}] 无 EC2 实例"
 
+    # 并发查询 CloudWatch 利用率 — 紧凑一行格式
+    low_util_rows: list[str] = []
+    checked = 0
+
+    if running_instances:
+        _progress_msg(f"  收集完成: {total} 个实例, {running_count} 个运行中, 开始利用率检测...")
+
+        def _check_one(item):
+            iid, n, it, rg, bi, tl = item
+            return (item, _check_instance_utilization(config, iid, rg, hours, cpu_threshold, mem_threshold))
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_check_one, item): item for item in running_instances}
+            for future in as_completed(futures):
+                checked += 1
+                if checked % 50 == 0 or checked == len(running_instances):
+                    _progress_msg(f"  利用率检测进度: {checked}/{len(running_instances)}")
+                try:
+                    (iid, n, it, rg, bi, tl), util_result = future.result()
+                    if util_result is not None:
+                        tag_str = ", ".join(tl[:3]) if tl else "-"
+                        ip = bi.get("私有IP", "-")
+                        avg_cpu = util_result.get("avg_cpu", "-")
+                        max_cpu = util_result.get("max_cpu", "-")
+                        avg_mem = util_result.get("avg_mem", "-")
+                        max_mem = util_result.get("max_mem", "-")
+                        row = (f"| {iid} | {n or '-'} | {it} | {rg} | {ip} "
+                               f"| {avg_cpu} | {max_cpu} | {avg_mem} | {max_mem} | {tag_str} |")
+                        low_util_rows.append(row)
+                except Exception:
+                    pass
+
+    # 生成概览头部
     total_running = sum(s["running"] for s in region_stats.values())
     total_stopped = sum(s["stopped"] for s in region_stats.values())
 
-    lines = [f"{label}📊 EC2 实例概览 [区域: {region_desc}]"]
-    lines.append(f"  总计: {total} 个实例 | 运行中: {total_running} | 已停止: {total_stopped}")
+    header_lines = [f"{label}📊 EC2 实例报告 [区域: {region_desc}]"]
+    header_lines.append(f"  总计: {total} 个实例 | 运行中: {total_running} | 已停止: {total_stopped}")
+    header_lines.append(f"  检测条件: CPU < {cpu_threshold}% 或 内存 < {mem_threshold}% (最近{time_desc})")
     for r, s in region_stats.items():
         r_total = s["running"] + s["stopped"] + s["other"]
-        lines.append(f"  {r}: {r_total} 个 (运行: {s['running']}, 停止: {s['stopped']})")
+        header_lines.append(f"  {r}: {r_total} 个 (运行: {s['running']}, 停止: {s['stopped']})")
+    header_lines.append(f"\n  已停止实例: {len(stopped_details)} 个")
+    header_lines.append(f"  低利用率实例: {len(low_util_rows)} 个")
+
+    header_text = "\n\n".join(header_lines)
+    return header_text, stopped_details, low_util_rows
+
+
+def list_ec2_aws(
+    config: AWSAccountConfig,
+    region: str = "",
+    cpu_threshold: float = 10.0,
+    mem_threshold: float = 10.0,
+    hours: float = 720,
+    max_workers: int = 20,
+) -> str:
+    """AWS EC2 统一查询工具（带缓存）。
+
+    首次调用执行完整扫描并缓存结果，后续调用直接从缓存读取。
+    停止实例：详细格式（多行）；低利用率实例：紧凑表格（一行一条）。
+    """
+    cache_key = _ec2_cache_key(config, region, cpu_threshold, mem_threshold, hours)
+
+    if cache_key in _ec2_scan_cache:
+        _progress_msg("  [缓存命中] 从缓存读取检测结果...")
+        header_text, stopped_details, low_util_rows = _ec2_scan_cache[cache_key]
+    else:
+        header_text, stopped_details, low_util_rows = _run_ec2_scan(
+            config, region, cpu_threshold, mem_threshold, hours, max_workers,
+        )
+        _ec2_scan_cache[cache_key] = (header_text, stopped_details, low_util_rows)
+
+    lines: list[str] = [header_text]
 
     if stopped_details:
-        lines.append(f"\n🔴 已停止实例详情 ({total_stopped} 个):")
+        lines.append(f"\n🔴 已停止的实例 ({len(stopped_details)} 个):")
         lines.extend(stopped_details)
-    else:
-        lines.append("\n✅ 无已停止实例")
+
+    if low_util_rows:
+        table_header = "| 实例ID | 名称 | 类型 | 区域 | 私有IP | 平均CPU | 最高CPU | 平均内存 | 最高内存 | 标签 |"
+        table_sep = "|--------|------|------|------|--------|---------|---------|----------|----------|------|"
+        lines.append(f"\n⚠️ 低利用率实例 ({len(low_util_rows)} 个):")
+        lines.append(table_header)
+        lines.append(table_sep)
+        lines.extend(low_util_rows)
+
+    if not stopped_details and not low_util_rows:
+        lines.append("\n✅ 所有实例运行正常，未发现闲置资源")
 
     return "\n\n".join(lines)
 
 
-def list_idle_ec2_aws(config: AWSAccountConfig, cpu_threshold: float = 5.0, hours: float = 24) -> str:
-    """检测 AWS EC2 闲置实例：已停止的 + CPU利用率低于阈值的运行中实例"""
-    label = _account_label(config)
-    query_regions = config.get_regions()
-
-    stopped_instances = []
-    low_cpu_instances = []
-    running_count = 0
-
-    for r in query_regions:
-        try:
-            ec2 = _get_client(config, service="ec2", region=r)
-            cw = _get_client(config, region=r)
-
-            response = ec2.describe_instances()
-            for reservation in response.get("Reservations", []):
-                for inst in reservation.get("Instances", []):
-                    state = inst.get("State", {}).get("Name", "")
-                    inst_id = inst["InstanceId"]
-                    inst_type = inst.get("InstanceType", "")
-
-                    name = ""
-                    for tag in inst.get("Tags", []):
-                        if tag["Key"] == "Name":
-                            name = tag["Value"]
-                            break
-
-                    base_info = {
-                        "区域": r,
-                        "可用区": inst.get("Placement", {}).get("AvailabilityZone", ""),
-                        "实例类型": inst_type,
-                        "私有IP": inst.get("PrivateIpAddress", ""),
-                        "公网IP": inst.get("PublicIpAddress", "无"),
-                    }
-
-                    if state == "stopped":
-                        launch_time = inst.get("LaunchTime", "")
-                        if hasattr(launch_time, "strftime"):
-                            base_info["最后启动"] = launch_time.strftime("%Y-%m-%d %H:%M")
-                        reason = inst.get("StateTransitionReason", "")
-                        if reason:
-                            base_info["停止原因"] = reason
-                        info = InstanceInfo(
-                            cloud="AWS", instance_id=inst_id, instance_name=name,
-                            instance_type=inst_type, status="🔴 stopped", region=r,
-                            extra=base_info,
-                        )
-                        stopped_instances.append(info.display())
-                        continue
-
-                    if state != "running":
-                        continue
-
-                    running_count += 1
-
-                    try:
-                        now = datetime.now(timezone.utc)
-                        start = now - timedelta(hours=hours)
-                        resp = cw.get_metric_statistics(
-                            Namespace="AWS/EC2", MetricName="CPUUtilization",
-                            Dimensions=[{"Name": "InstanceId", "Value": inst_id}],
-                            StartTime=start, EndTime=now,
-                            Period=3600, Statistics=["Average"],
-                        )
-                        dps = resp.get("Datapoints", [])
-                        if dps:
-                            avg_cpu = sum(dp.get("Average", 0) for dp in dps) / len(dps)
-                            max_cpu = max(dp.get("Average", 0) for dp in dps)
-
-                            if avg_cpu < cpu_threshold:
-                                base_info[f"平均CPU({hours:.0f}h)"] = f"{avg_cpu:.2f}%"
-                                base_info["最高CPU"] = f"{max_cpu:.2f}%"
-                                base_info["数据点数"] = str(len(dps))
-                                info = InstanceInfo(
-                                    cloud="AWS", instance_id=inst_id, instance_name=name,
-                                    instance_type=inst_type, status=f"⚠️ 疑似闲置 (CPU {avg_cpu:.1f}%)", region=r,
-                                    extra=base_info,
-                                )
-                                low_cpu_instances.append(info.display())
-                    except Exception:
-                        pass
-
-        except Exception as e:
-            stopped_instances.append(f"区域 {r} 查询失败: {e}")
-
-    region_desc = ", ".join(query_regions)
-    lines = [f"{label}📊 EC2 闲置资源检测 [区域: {region_desc}]"]
-    lines.append(f"  检测条件: 已停止 或 CPU < {cpu_threshold}% (最近{hours:.0f}小时)")
-    lines.append(f"  运行中实例总数: {running_count}")
-    lines.append(f"  已停止实例: {len(stopped_instances)} 个")
-    lines.append(f"  低CPU实例: {len(low_cpu_instances)} 个")
-
-    if stopped_instances:
-        lines.append(f"\n🔴 已停止的实例 ({len(stopped_instances)} 个):")
-        lines.extend(stopped_instances)
-
-    if low_cpu_instances:
-        lines.append(f"\n⚠️ 疑似闲置实例 - CPU < {cpu_threshold}% ({len(low_cpu_instances)} 个):")
-        lines.extend(low_cpu_instances)
-
-    if not stopped_instances and not low_cpu_instances:
-        lines.append("\n✅ 未发现闲置实例")
-
-    return "\n\n".join(lines)
+def _progress_msg(msg: str):
+    print(msg, file=sys.stderr, flush=True)
 
 
 # ──────────────── S3 对象存储 ────────────────

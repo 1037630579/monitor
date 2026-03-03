@@ -154,6 +154,69 @@ async def single_query_mode(prompt: str, config_path: str | None = None):
             console.print("[yellow]⚠️ Webhook 推送失败[/yellow]")
 
 
+def direct_ec2_check(config_path: str | None = None,
+                     cpu_override: float | None = None,
+                     mem_override: float | None = None,
+                     hours_override: float | None = None):
+    """直接调用 EC2 闲置检测，跳过 Agent/LLM，无需对话。
+    参数优先级：命令行 > config.yaml > 代码默认值"""
+    import time
+    from cloud_monitor.tools.aws import list_ec2_aws
+
+    config = load_config(config_path)
+    if not config.aws.enabled:
+        console.print("[red]错误: AWS 未启用，请检查 config.yaml[/red]")
+        sys.exit(1)
+
+    ec2_cfg = config.ec2_check
+    cpu_threshold = cpu_override if cpu_override is not None else ec2_cfg.cpu_threshold
+    mem_threshold = mem_override if mem_override is not None else ec2_cfg.mem_threshold
+    hours = hours_override if hours_override is not None else ec2_cfg.hours
+
+    days = hours / 24
+    time_desc = f"{days:.0f}天" if hours >= 48 else f"{hours:.0f}小时"
+    console.print(Panel(
+        f"[bold]AWS EC2 闲置检测[/bold]\n"
+        f"CPU 阈值: {cpu_threshold}%  |  内存阈值: {mem_threshold}%  |  时间窗口: {time_desc}\n"
+        f"并发线程: {ec2_cfg.max_workers}  |  账户数: {len(config.aws.accounts)}\n"
+        f"[dim]参数来源: config.yaml → ec2_check[/dim]",
+        border_style="cyan",
+    ))
+
+    webhook_on = config.webhook.enabled and config.webhook.url
+    all_results: list[str] = []
+
+    for acc in config.aws.accounts:
+        regions = acc.get_regions()
+        console.print(f"\n[cyan]▶ 账户 [{acc.name}]  区域: {', '.join(regions)}[/cyan]")
+        t0 = time.time()
+
+        result = list_ec2_aws(
+            acc,
+            cpu_threshold=cpu_threshold,
+            mem_threshold=mem_threshold,
+            hours=hours,
+            max_workers=ec2_cfg.max_workers,
+        )
+        elapsed = time.time() - t0
+        all_results.append(result)
+
+        console.print()
+        try:
+            console.print(Markdown(result))
+        except Exception:
+            console.print(result)
+        console.print(f"[dim]  ⏱ 耗时: {elapsed:.1f}s[/dim]")
+
+    if webhook_on and all_results:
+        body = "📋 AWS EC2 闲置检测报告\n\n" + "\n\n".join(all_results)
+        ok = send_webhook(config.webhook.url, body)
+        if ok:
+            console.print("\n[dim]✅ 已推送到 Webhook[/dim]")
+        else:
+            console.print("\n[yellow]⚠️ Webhook 推送失败[/yellow]")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="多云统一监控助手 - 基于 Claude Agents SDK",
@@ -175,7 +238,30 @@ def main():
         "-q", "--query",
         type=str,
         default=None,
-        help="单次查询模式，直接执行指定查询",
+        help="单次查询模式，通过 Agent 执行指定查询",
+    )
+    parser.add_argument(
+        "--ec2",
+        action="store_true",
+        help="直接运行 AWS EC2 闲置检测（跳过 Agent，参数从 config.yaml 的 ec2_check 段读取）",
+    )
+    parser.add_argument(
+        "--cpu",
+        type=float,
+        default=None,
+        help="覆盖 CPU 利用率阈值%%（不传则使用 config.yaml 中的值）",
+    )
+    parser.add_argument(
+        "--mem",
+        type=float,
+        default=None,
+        help="覆盖内存利用率阈值%%（不传则使用 config.yaml 中的值）",
+    )
+    parser.add_argument(
+        "--hours",
+        type=float,
+        default=None,
+        help="覆盖检测时间窗口/小时（不传则使用 config.yaml 中的值）",
     )
     parser.add_argument(
         "-c", "--config",
@@ -186,7 +272,9 @@ def main():
 
     args = parser.parse_args()
 
-    if args.query:
+    if args.ec2:
+        direct_ec2_check(args.config, args.cpu, args.mem, args.hours)
+    elif args.query:
         asyncio.run(single_query_mode(args.query, args.config))
     else:
         asyncio.run(interactive_mode(args.config))
