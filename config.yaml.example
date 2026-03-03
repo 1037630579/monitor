@@ -55,3 +55,9 @@ ec2_check:
 webhook:
   enabled: false
   url: "https://your-webhook-url"
+
+# MongoDB 存储（闲置资源检测结果入库 + 前端查询）
+mongodb:
+  enabled: false
+  uri: "mongodb://user:password@host:27017"
+  db_name: "cloud_monitor"

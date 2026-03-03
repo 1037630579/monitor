@@ -399,18 +399,33 @@ def get_vpn_status_aws(config: AWSAccountConfig, vpn_id: str = "", hours: float 
 
 # ──────────────── EC2 云主机（统一工具：概览 + 停止实例 + 低利用率检测）────────────────
 
-# 缓存：检测结果（header_text, stopped_details, low_util_details）
-_ec2_scan_cache: dict[str, tuple[str, list[str], list[str]]] = {}
 
+def _get_metric_paged(
+    cw, namespace: str, metric_name: str, inst_id: str,
+    start: datetime, end: datetime, dim_name: str = "InstanceId",
+) -> list[dict]:
+    """分段查询 CloudWatch 指标，绕过单次 1440 数据点上限。
+    每段查 3 天（864 个 5 分钟点），确保不超限。
+    """
+    all_dps: list[dict] = []
+    seg_start = start
+    seg_hours = 72
 
-def _ec2_cache_key(config: AWSAccountConfig, region: str,
-                   cpu_threshold: float, mem_threshold: float, hours: float) -> str:
-    return f"{config.name}|{region}|{cpu_threshold}|{mem_threshold}|{hours}"
+    while seg_start < end:
+        seg_end = min(seg_start + timedelta(hours=seg_hours), end)
+        try:
+            resp = cw.get_metric_statistics(
+                Namespace=namespace, MetricName=metric_name,
+                Dimensions=[{"Name": dim_name, "Value": inst_id}],
+                StartTime=seg_start, EndTime=seg_end,
+                Period=300, Statistics=["Average", "Maximum"],
+            )
+            all_dps.extend(resp.get("Datapoints", []))
+        except Exception:
+            pass
+        seg_start = seg_end
 
-
-def ec2_clear_cache():
-    """清空 EC2 检测缓存"""
-    _ec2_scan_cache.clear()
+    return all_dps
 
 
 def _check_instance_utilization(
@@ -425,46 +440,27 @@ def _check_instance_utilization(
     cw = _get_client(config, region=region)
     now_utc = datetime.now(timezone.utc)
     start = now_utc - timedelta(hours=hours)
-    time_label = f"{hours/24:.0f}天" if hours >= 48 else f"{hours:.0f}h"
 
     result: dict[str, str] = {}
     is_idle = False
 
-    try:
-        resp = cw.get_metric_statistics(
-            Namespace="AWS/EC2", MetricName="CPUUtilization",
-            Dimensions=[{"Name": "InstanceId", "Value": inst_id}],
-            StartTime=start, EndTime=now_utc,
-            Period=3600, Statistics=["Average"],
-        )
-        dps = resp.get("Datapoints", [])
-        if dps:
-            avg_cpu = sum(dp.get("Average", 0) for dp in dps) / len(dps)
-            max_cpu = max(dp.get("Average", 0) for dp in dps)
-            result["avg_cpu"] = f"{avg_cpu:.1f}%"
-            result["max_cpu"] = f"{max_cpu:.1f}%"
-            if avg_cpu < cpu_threshold:
-                is_idle = True
-    except Exception:
-        pass
+    dps = _get_metric_paged(cw, "AWS/EC2", "CPUUtilization", inst_id, start, now_utc)
+    if dps:
+        avg_cpu = sum(dp.get("Average", 0) for dp in dps) / len(dps)
+        max_cpu = max(dp.get("Maximum", 0) for dp in dps)
+        result["avg_cpu"] = f"{avg_cpu:.1f}%"
+        result["max_cpu"] = f"{max_cpu:.1f}%"
+        if avg_cpu < cpu_threshold:
+            is_idle = True
 
-    try:
-        resp = cw.get_metric_statistics(
-            Namespace="CWAgent", MetricName="mem_used_percent",
-            Dimensions=[{"Name": "InstanceId", "Value": inst_id}],
-            StartTime=start, EndTime=now_utc,
-            Period=3600, Statistics=["Average"],
-        )
-        dps = resp.get("Datapoints", [])
-        if dps:
-            avg_mem = sum(dp.get("Average", 0) for dp in dps) / len(dps)
-            max_mem = max(dp.get("Average", 0) for dp in dps)
-            result["avg_mem"] = f"{avg_mem:.1f}%"
-            result["max_mem"] = f"{max_mem:.1f}%"
-            if avg_mem < mem_threshold:
-                is_idle = True
-    except Exception:
-        pass
+    dps = _get_metric_paged(cw, "CWAgent", "mem_used_percent", inst_id, start, now_utc)
+    if dps:
+        avg_mem = sum(dp.get("Average", 0) for dp in dps) / len(dps)
+        max_mem = max(dp.get("Maximum", 0) for dp in dps)
+        result["avg_mem"] = f"{avg_mem:.1f}%"
+        result["max_mem"] = f"{max_mem:.1f}%"
+        if avg_mem < mem_threshold:
+            is_idle = True
 
     if is_idle:
         return result
@@ -478,20 +474,25 @@ def _run_ec2_scan(
     mem_threshold: float,
     hours: float,
     max_workers: int,
-) -> tuple[str, list[str], list[str]]:
-    """执行完整的 EC2 检测扫描，返回 (header_text, stopped_details, low_util_details)"""
+) -> tuple[str, list[str], list[str], list[dict]]:
+    """执行完整的 EC2 检测扫描。
+
+    返回 (header_text, stopped_details, low_util_rows, structured_data)
+    structured_data 为结构化 dict 列表，用于入库。
+    """
     label = _account_label(config)
     query_regions = [region] if region else config.get_regions()
 
     region_stats: dict[str, dict[str, int]] = {}
     stopped_details: list[str] = []
+    structured: list[dict] = []
     total = 0
     running_count = 0
 
     days = hours / 24
     time_desc = f"{days:.0f}天" if hours >= 48 else f"{hours:.0f}小时"
 
-    running_instances: list[tuple[str, str, str, str, dict, list]] = []
+    running_instances: list[tuple[str, str, str, str, dict, list, dict]] = []
 
     for r in query_regions:
         stats = {"running": 0, "stopped": 0, "other": 0}
@@ -507,38 +508,49 @@ def _run_ec2_scan(
                         total += 1
 
                         name = ""
-                        tags_list = []
+                        tags_dict: dict[str, str] = {}
+                        tags_list: list[str] = []
                         for tag in inst.get("Tags", []):
                             if tag["Key"] == "Name":
                                 name = tag["Value"]
                             else:
                                 tags_list.append(f"{tag['Key']}={tag['Value']}")
+                                tags_dict[tag["Key"]] = tag["Value"]
+
+                        az = inst.get("Placement", {}).get("AvailabilityZone", "")
+                        private_ip = inst.get("PrivateIpAddress", "")
+                        public_ip = inst.get("PublicIpAddress", "")
 
                         base_info: dict[str, str] = {
-                            "可用区": inst.get("Placement", {}).get("AvailabilityZone", ""),
-                            "私有IP": inst.get("PrivateIpAddress", ""),
-                            "公网IP": inst.get("PublicIpAddress", "无"),
+                            "可用区": az,
+                            "私有IP": private_ip,
+                            "公网IP": public_ip or "无",
                         }
 
                         if state == "stopped":
                             stats["stopped"] += 1
+                            extra_db: dict[str, str] = {}
                             launch_time = inst.get("LaunchTime", "")
                             if hasattr(launch_time, "strftime"):
                                 base_info["最后启动"] = launch_time.strftime("%Y-%m-%d %H:%M")
+                                extra_db["last_launch"] = launch_time.strftime("%Y-%m-%d %H:%M")
                                 now_utc = datetime.now(timezone.utc)
                                 lt = launch_time if launch_time.tzinfo else launch_time.replace(tzinfo=timezone.utc)
                                 d = (now_utc - lt).days
                                 base_info["距今"] = f"{d // 365}年{d % 365}天" if d > 365 else f"{d}天"
+                                extra_db["stopped_days"] = str(d)
 
                             reason = inst.get("StateTransitionReason", "")
                             if reason:
                                 base_info["停止原因"] = reason
+                                extra_db["stop_reason"] = reason
 
                             volumes = inst.get("BlockDeviceMappings", [])
                             if volumes:
                                 vol_ids = [v.get("Ebs", {}).get("VolumeId", "") for v in volumes if v.get("Ebs")]
                                 base_info["EBS卷"] = ", ".join(vol_ids) if vol_ids else "无"
                                 base_info["EBS卷数"] = str(len(vol_ids))
+                                extra_db["ebs_volumes"] = ", ".join(vol_ids)
 
                             sgs = inst.get("SecurityGroups", [])
                             if sgs:
@@ -555,6 +567,16 @@ def _run_ec2_scan(
                                 extra=base_info,
                             )
                             stopped_details.append(info.display())
+                            structured.append({
+                                "resource_type": "EC2",
+                                "instance_id": inst_id, "instance_name": name,
+                                "instance_type": inst_type, "status": "stopped",
+                                "region": r, "availability_zone": az,
+                                "private_ip": private_ip, "public_ip": public_ip or None,
+                                "avg_cpu": None, "max_cpu": None,
+                                "avg_mem": None, "max_mem": None,
+                                "tags": tags_dict, "extra": extra_db,
+                            })
                             continue
 
                         if state != "running":
@@ -563,7 +585,7 @@ def _run_ec2_scan(
 
                         stats["running"] += 1
                         running_count += 1
-                        running_instances.append((inst_id, name, inst_type, r, base_info, tags_list))
+                        running_instances.append((inst_id, name, inst_type, r, base_info, tags_list, tags_dict))
 
         except Exception as e:
             stopped_details.append(f"区域 {r} 查询失败: {e}")
@@ -572,7 +594,6 @@ def _run_ec2_scan(
 
     region_desc = ", ".join(query_regions)
 
-    # 并发查询 CloudWatch 利用率 — 紧凑一行格式
     low_util_rows: list[str] = []
     checked = 0
 
@@ -580,7 +601,8 @@ def _run_ec2_scan(
         _progress_msg(f"  收集完成: {total} 个实例, {running_count} 个运行中, 开始利用率检测...")
 
         def _check_one(item):
-            iid, n, it, rg, bi, tl = item
+            iid = item[0]
+            rg = item[3]
             return (item, _check_instance_utilization(config, iid, rg, hours, cpu_threshold, mem_threshold))
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -590,7 +612,8 @@ def _run_ec2_scan(
                 if checked % 50 == 0 or checked == len(running_instances):
                     _progress_msg(f"  利用率检测进度: {checked}/{len(running_instances)}")
                 try:
-                    (iid, n, it, rg, bi, tl), util_result = future.result()
+                    item_tuple, util_result = future.result()
+                    iid, n, it, rg, bi, tl, td = item_tuple
                     if util_result is not None:
                         tag_str = ", ".join(tl[:3]) if tl else "-"
                         ip = bi.get("私有IP", "-")
@@ -601,10 +624,26 @@ def _run_ec2_scan(
                         row = (f"| {iid} | {n or '-'} | {it} | {rg} | {ip} "
                                f"| {avg_cpu} | {max_cpu} | {avg_mem} | {max_mem} | {tag_str} |")
                         low_util_rows.append(row)
+
+                        def _parse_pct(v: str) -> float | None:
+                            try:
+                                return float(v.replace("%", ""))
+                            except (ValueError, AttributeError):
+                                return None
+
+                        structured.append({
+                            "resource_type": "EC2",
+                            "instance_id": iid, "instance_name": n,
+                            "instance_type": it, "status": "low_utilization",
+                            "region": rg, "availability_zone": bi.get("可用区", ""),
+                            "private_ip": bi.get("私有IP", ""), "public_ip": bi.get("公网IP", None),
+                            "avg_cpu": _parse_pct(avg_cpu), "max_cpu": _parse_pct(max_cpu),
+                            "avg_mem": _parse_pct(avg_mem), "max_mem": _parse_pct(max_mem),
+                            "tags": td, "extra": {},
+                        })
                 except Exception:
                     pass
 
-    # 生成概览头部
     total_running = sum(s["running"] for s in region_stats.values())
     total_stopped = sum(s["stopped"] for s in region_stats.values())
 
@@ -618,7 +657,7 @@ def _run_ec2_scan(
     header_lines.append(f"  低利用率实例: {len(low_util_rows)} 个")
 
     header_text = "\n\n".join(header_lines)
-    return header_text, stopped_details, low_util_rows
+    return header_text, stopped_details, low_util_rows, structured
 
 
 def list_ec2_aws(
@@ -628,22 +667,15 @@ def list_ec2_aws(
     mem_threshold: float = 10.0,
     hours: float = 720,
     max_workers: int = 20,
-) -> str:
-    """AWS EC2 统一查询工具（带缓存）。
+) -> tuple[str, list[dict]]:
+    """AWS EC2 统一查询工具。
 
-    首次调用执行完整扫描并缓存结果，后续调用直接从缓存读取。
-    停止实例：详细格式（多行）；低利用率实例：紧凑表格（一行一条）。
+    返回 (text_report, structured_data)。
+    每次调用都执行完整扫描，结果写入 MySQL，不做本地缓存。
     """
-    cache_key = _ec2_cache_key(config, region, cpu_threshold, mem_threshold, hours)
-
-    if cache_key in _ec2_scan_cache:
-        _progress_msg("  [缓存命中] 从缓存读取检测结果...")
-        header_text, stopped_details, low_util_rows = _ec2_scan_cache[cache_key]
-    else:
-        header_text, stopped_details, low_util_rows = _run_ec2_scan(
-            config, region, cpu_threshold, mem_threshold, hours, max_workers,
-        )
-        _ec2_scan_cache[cache_key] = (header_text, stopped_details, low_util_rows)
+    header_text, stopped_details, low_util_rows, structured = _run_ec2_scan(
+        config, region, cpu_threshold, mem_threshold, hours, max_workers,
+    )
 
     lines: list[str] = [header_text]
 
@@ -662,7 +694,7 @@ def list_ec2_aws(
     if not stopped_details and not low_util_rows:
         lines.append("\n✅ 所有实例运行正常，未发现闲置资源")
 
-    return "\n\n".join(lines)
+    return "\n\n".join(lines), structured
 
 
 def _progress_msg(msg: str):

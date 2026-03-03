@@ -154,6 +154,74 @@ async def single_query_mode(prompt: str, config_path: str | None = None):
             console.print("[yellow]⚠️ Webhook 推送失败[/yellow]")
 
 
+def _init_db_if_enabled(config):
+    """若 MySQL 已启用则初始化连接"""
+    if config.mysql.enabled:
+        try:
+            from cloud_monitor.db import init_db
+            init_db(config.mysql)
+            return True
+        except Exception as e:
+            console.print(f"[yellow]⚠️ MySQL 连接失败: {e}，跳过入库[/yellow]")
+    return False
+
+
+def direct_huawei_check(config_path: str | None = None,
+                        checks: list[str] | None = None):
+    """直接运行华为云风险巡检，跳过 Agent/LLM"""
+    import time
+    from cloud_monitor.tools.huawei_check import ALL_CHECKS, run_all_checks
+
+    config = load_config(config_path)
+    if not config.huawei.enabled:
+        console.print("[red]错误: 华为云未启用，请检查 config.yaml[/red]")
+        sys.exit(1)
+
+    db_ok = _init_db_if_enabled(config)
+
+    check_names = [name for _, name, _ in ALL_CHECKS]
+    if checks:
+        check_names = [name for ctype, name, _ in ALL_CHECKS if ctype in checks]
+
+    console.print(Panel(
+        f"[bold]华为云风险巡检[/bold]\n"
+        f"区域: {config.huawei.region}  |  巡检项: {len(check_names)} 个\n"
+        f"[dim]{'、'.join(check_names)}[/dim]\n"
+        f"[dim]MySQL: {'已启用' if db_ok else '未启用'}[/dim]",
+        border_style="cyan",
+    ))
+
+    t0 = time.time()
+    full_text, results_data = run_all_checks(config.huawei, checks=checks)
+    elapsed = time.time() - t0
+
+    console.print()
+    try:
+        console.print(Markdown(full_text))
+    except Exception:
+        console.print(full_text)
+
+    if db_ok:
+        from cloud_monitor.db import save_check_results
+        total_saved = 0
+        for check_type, records in results_data.items():
+            save_check_results(check_type, records)
+            total_saved += len(records)
+        console.print(f"\n[dim]💾 已写入 MySQL: {total_saved} 条巡检记录[/dim]")
+
+    total_issues = sum(len(r) for r in results_data.values())
+    console.print(f"[dim]⏱ 总耗时: {elapsed:.1f}s | 发现风险项: {total_issues} 个[/dim]")
+
+    webhook_on = config.webhook.enabled and config.webhook.url
+    if webhook_on:
+        body = f"📋 华为云风险巡检报告\n\n{full_text}"
+        ok = send_webhook(config.webhook.url, body)
+        if ok:
+            console.print("[dim]✅ 已推送到 Webhook[/dim]")
+        else:
+            console.print("[yellow]⚠️ Webhook 推送失败[/yellow]")
+
+
 def direct_ec2_check(config_path: str | None = None,
                      cpu_override: float | None = None,
                      mem_override: float | None = None,
@@ -168,6 +236,8 @@ def direct_ec2_check(config_path: str | None = None,
         console.print("[red]错误: AWS 未启用，请检查 config.yaml[/red]")
         sys.exit(1)
 
+    db_ok = _init_db_if_enabled(config)
+
     ec2_cfg = config.ec2_check
     cpu_threshold = cpu_override if cpu_override is not None else ec2_cfg.cpu_threshold
     mem_threshold = mem_override if mem_override is not None else ec2_cfg.mem_threshold
@@ -179,19 +249,20 @@ def direct_ec2_check(config_path: str | None = None,
         f"[bold]AWS EC2 闲置检测[/bold]\n"
         f"CPU 阈值: {cpu_threshold}%  |  内存阈值: {mem_threshold}%  |  时间窗口: {time_desc}\n"
         f"并发线程: {ec2_cfg.max_workers}  |  账户数: {len(config.aws.accounts)}\n"
-        f"[dim]参数来源: config.yaml → ec2_check[/dim]",
+        f"[dim]参数来源: config.yaml → ec2_check | MySQL: {'已启用' if db_ok else '未启用'}[/dim]",
         border_style="cyan",
     ))
 
     webhook_on = config.webhook.enabled and config.webhook.url
     all_results: list[str] = []
+    scan_params = {"cpu_threshold": cpu_threshold, "mem_threshold": mem_threshold, "hours": hours}
 
     for acc in config.aws.accounts:
         regions = acc.get_regions()
         console.print(f"\n[cyan]▶ 账户 [{acc.name}]  区域: {', '.join(regions)}[/cyan]")
         t0 = time.time()
 
-        result = list_ec2_aws(
+        text, structured = list_ec2_aws(
             acc,
             cpu_threshold=cpu_threshold,
             mem_threshold=mem_threshold,
@@ -199,13 +270,18 @@ def direct_ec2_check(config_path: str | None = None,
             max_workers=ec2_cfg.max_workers,
         )
         elapsed = time.time() - t0
-        all_results.append(result)
+        all_results.append(text)
+
+        if db_ok and structured:
+            from cloud_monitor.db import save_idle_resources
+            save_idle_resources("AWS", acc.name, structured, scan_params)
+            console.print(f"[dim]  💾 已写入 MySQL: {len(structured)} 条[/dim]")
 
         console.print()
         try:
-            console.print(Markdown(result))
+            console.print(Markdown(text))
         except Exception:
-            console.print(result)
+            console.print(text)
         console.print(f"[dim]  ⏱ 耗时: {elapsed:.1f}s[/dim]")
 
     if webhook_on and all_results:
@@ -230,6 +306,13 @@ def main():
   python main.py -q "查看华为云 ECS 实例列表"
   python main.py -q "查询 VPN vpn-xxx 最近1小时流量"
 
+  # EC2 闲置检测
+  python main.py --ec2
+
+  # 启动 Web 服务（API + 前端）
+  python main.py --server
+  python main.py --server --port 3000
+
   # 指定配置文件
   python main.py -c /path/to/config.yaml
 """,
@@ -244,6 +327,28 @@ def main():
         "--ec2",
         action="store_true",
         help="直接运行 AWS EC2 闲置检测（跳过 Agent，参数从 config.yaml 的 ec2_check 段读取）",
+    )
+    parser.add_argument(
+        "--huawei-check",
+        action="store_true",
+        help="直接运行华为云风险巡检（ECS安全组/CCE副本/RDS高可用/DMS集群/RDS网络/DDS网络/RDS参数/CCE Pod/ECS闲置）",
+    )
+    parser.add_argument(
+        "--checks",
+        type=str,
+        default=None,
+        help="指定巡检项（逗号分隔），如: rds_ha,rds_params_double_one,ecs_security_group",
+    )
+    parser.add_argument(
+        "--server",
+        action="store_true",
+        help="启动 Web 服务（FastAPI API + Vue 前端）",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8080,
+        help="Web 服务端口 (默认: 8080)",
     )
     parser.add_argument(
         "--cpu",
@@ -272,7 +377,22 @@ def main():
 
     args = parser.parse_args()
 
-    if args.ec2:
+    if args.server:
+        from cloud_monitor.server import run_server
+        console.print(Panel(
+            f"[bold]多云闲置资源管理[/bold]\n"
+            f"API 地址: http://0.0.0.0:{args.port}/api\n"
+            f"前端地址: http://0.0.0.0:{args.port}\n"
+            f"[dim]需要先构建前端: cd web && npm run build[/dim]",
+            border_style="cyan",
+        ))
+        run_server(port=args.port)
+    elif args.huawei_check:
+        check_list = None
+        if args.checks:
+            check_list = [c.strip() for c in args.checks.split(",") if c.strip()]
+        direct_huawei_check(args.config, checks=check_list)
+    elif args.ec2:
         direct_ec2_check(args.config, args.cpu, args.mem, args.hours)
     elif args.query:
         asyncio.run(single_query_mode(args.query, args.config))

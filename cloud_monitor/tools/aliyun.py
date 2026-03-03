@@ -152,8 +152,11 @@ def get_metric_data_aliyun(
 
 # ──────────────── ECS 云主机（概览 + 已停止详情）────────────────
 
-def list_ecs_instances_aliyun(config: AliyunConfig) -> str:
-    """列出阿里云 ECS 实例概览：按状态统计，仅输出已停止实例详情"""
+def list_ecs_instances_aliyun(config: AliyunConfig) -> tuple[str, list[dict]]:
+    """列出阿里云 ECS 实例概览：按状态统计，仅输出已停止实例详情。
+
+    返回 (text_report, structured_data)。
+    """
     try:
         from alibabacloud_ecs20140526.client import Client as EcsClient
         from alibabacloud_ecs20140526.models import DescribeInstancesRequest
@@ -179,12 +182,13 @@ def list_ecs_instances_aliyun(config: AliyunConfig) -> str:
             page += 1
 
         if not all_instances:
-            return f"阿里云区域 {config.region_id} 无 ECS 实例"
+            return f"阿里云区域 {config.region_id} 无 ECS 实例", []
 
         running_count = 0
         stopped_count = 0
         other_count = 0
         stopped_details = []
+        structured: list[dict] = []
 
         for inst in all_instances:
             status = (inst.status or "").lower()
@@ -192,19 +196,26 @@ def list_ecs_instances_aliyun(config: AliyunConfig) -> str:
                 running_count += 1
             elif status == "stopped":
                 stopped_count += 1
+                private_ip = ", ".join(inst.vpc_attributes.private_ip_address.ip_address) if inst.vpc_attributes and inst.vpc_attributes.private_ip_address else ""
+                public_ip = ", ".join(inst.public_ip_address.ip_address) if inst.public_ip_address and inst.public_ip_address.ip_address else ""
+
                 extra: dict[str, str] = {
                     "区域": config.region_id,
                     "可用区": inst.zone_id or "",
                     "实例类型": inst.instance_type or "",
-                    "私有IP": ", ".join(inst.vpc_attributes.private_ip_address.ip_address) if inst.vpc_attributes and inst.vpc_attributes.private_ip_address else "",
-                    "公网IP": ", ".join(inst.public_ip_address.ip_address) if inst.public_ip_address and inst.public_ip_address.ip_address else "无",
+                    "私有IP": private_ip,
+                    "公网IP": public_ip or "无",
                 }
+                extra_db: dict[str, str] = {}
                 if inst.creation_time:
                     extra["创建时间"] = inst.creation_time
+                    extra_db["creation_time"] = inst.creation_time
                 if inst.expired_time:
                     extra["到期时间"] = inst.expired_time
+                    extra_db["expired_time"] = inst.expired_time
                 if inst.stopped_mode:
                     extra["停止模式"] = inst.stopped_mode
+                    extra_db["stopped_mode"] = inst.stopped_mode
 
                 info = InstanceInfo(
                     cloud="阿里云",
@@ -216,6 +227,19 @@ def list_ecs_instances_aliyun(config: AliyunConfig) -> str:
                     extra=extra,
                 )
                 stopped_details.append(info.display())
+                structured.append({
+                    "instance_id": inst.instance_id or "",
+                    "instance_name": inst.instance_name or "",
+                    "instance_type": inst.instance_type or "",
+                    "status": "stopped",
+                    "region": config.region_id,
+                    "availability_zone": inst.zone_id or "",
+                    "private_ip": private_ip,
+                    "public_ip": public_ip or None,
+                    "avg_cpu": None, "max_cpu": None,
+                    "avg_mem": None, "max_mem": None,
+                    "tags": {}, "extra": extra_db,
+                })
             else:
                 other_count += 1
 
@@ -229,9 +253,9 @@ def list_ecs_instances_aliyun(config: AliyunConfig) -> str:
         else:
             lines.append("\n✅ 无已停止实例")
 
-        return "\n\n".join(lines)
+        return "\n\n".join(lines), structured
     except Exception as e:
-        return f"阿里云查询 ECS 实例失败: {e}\n{traceback.format_exc()}"
+        return f"阿里云查询 ECS 实例失败: {e}\n{traceback.format_exc()}", []
 
 
 # ──────────────── OSS 对象存储 ────────────────

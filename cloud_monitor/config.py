@@ -84,12 +84,24 @@ class EC2CheckConfig:
 
 
 @dataclass
+class MySQLConfig:
+    """MySQL 存储配置"""
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = 3306
+    user: str = "root"
+    password: str = ""
+    db_name: str = "cloud_monitor"
+
+
+@dataclass
 class AppConfig:
     huawei: HuaweiCloudConfig = field(default_factory=HuaweiCloudConfig)
     aliyun: AliyunConfig = field(default_factory=AliyunConfig)
     aws: AWSConfig = field(default_factory=AWSConfig)
     webhook: WebhookConfig = field(default_factory=WebhookConfig)
     ec2_check: EC2CheckConfig = field(default_factory=EC2CheckConfig)
+    mysql: MySQLConfig = field(default_factory=MySQLConfig)
 
     def enabled_clouds(self) -> list[str]:
         clouds = []
@@ -176,6 +188,17 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
                 mem_threshold=float(ec2.get("mem_threshold", 10.0)),
                 hours=float(ec2.get("hours", 360)),
                 max_workers=int(ec2.get("max_workers", 20)),
+            )
+
+        my = data.get("mysql", {})
+        if my:
+            cfg.mysql = MySQLConfig(
+                enabled=my.get("enabled", False),
+                host=my.get("host", "127.0.0.1"),
+                port=int(my.get("port", 3306)),
+                user=my.get("user", "root"),
+                password=my.get("password", ""),
+                db_name=my.get("db_name", "cloud_monitor"),
             )
 
     # 环境变量覆盖

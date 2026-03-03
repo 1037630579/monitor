@@ -1,0 +1,77 @@
+---
+description: AWS EC2 巡检 + 华为云巡检的开发规范。修改巡检相关函数、工具注册、检测逻辑时自动生效。
+globs: cloud_monitor/tools/aws.py,cloud_monitor/tools/huawei_check.py,cloud_monitor/agent.py,cloud_monitor/config.py,cloud_monitor/db.py,cloud_monitor/server.py,main.py
+alwaysApply: false
+---
+
+# 云巡检开发规范
+
+## 1. 项目架构
+
+```
+config.yaml
+    ↓
+config.py (EC2CheckConfig / MySQLConfig / HuaweiCloudConfig)
+    ↓
+┌─────────────────────────┐  ┌────────────────────────────┐
+│ main.py --ec2           │  │ main.py --huawei-check     │
+│ direct_ec2_check()      │  │ direct_huawei_check()      │
+└──────────┬──────────────┘  └──────────┬─────────────────┘
+           ↓                            ↓
+  aws.py: list_ec2_aws()     huawei_check.py: run_all_checks()
+           ↓                            ↓
+  db.py: save_idle_resources  db.py: save_check_results
+           ↓                            ↓
+         MySQL idle_resources        MySQL huawei_checks
+           ↓                            ↓
+  server.py /api/aws-checks   server.py /api/huawei-checks
+```
+
+## 2. AWS EC2 巡检
+
+工具名称：`aws_ec2`，一次调用返回全部结果。
+
+| 类别 | 数据源 | Namespace | MetricName | Period | Statistics | 判定 |
+|------|--------|-----------|------------|--------|-----------|------|
+| 已停止 | EC2 API | - | - | - | - | `state == "stopped"` |
+| CPU 闲置 | CloudWatch | `AWS/EC2` | `CPUUtilization` | **300s** | **Average + Maximum** | avg < threshold |
+| 内存闲置 | CloudWatch | `CWAgent` | `mem_used_percent` | **300s** | **Average + Maximum** | avg < threshold |
+
+- `avg_cpu` / `avg_mem`：所有数据点 Average 的均值
+- `max_cpu` / `max_mem`：所有数据点 **Maximum** 的最大值（真正的峰值）
+- CPU 或内存**任一**低于阈值即标记为低利用率
+
+## 3. 华为云巡检（9 项）
+
+| 序号 | check_type | 资源类型 | 说明 |
+|------|-----------|---------|------|
+| 1 | ecs_security_group | ECS | 安全组规则检查 |
+| 2 | cce_workload_replica | CCE | 工作负载可用副本数 |
+| 3 | rds_ha | RDS | 实例高可用部署 |
+| 4 | dms_rabbitmq_cluster | DMS | RabbitMQ 集群部署 |
+| 5 | rds_network_type | RDS | 网络是否通用型 |
+| 6 | dds_network_type | DDS | 网络是否通用型 |
+| 7 | rds_params_double_one | RDS | 参数配置双1检查 |
+| 8 | cce_node_pods | CCE | 节点 pod 数量过多 |
+| 9 | ecs_idle | ECS | 实例规格/CPU利用率 |
+
+文件：`cloud_monitor/tools/huawei_check.py`，只保留这 9 项，不含 ECS 列表/OBS/CDN/监控指标等功能。
+
+## 4. 存储层（MySQL 8.0）
+
+| 表 | 用途 | 关键字段 |
+|----|------|---------|
+| idle_resources | AWS EC2 巡检 | cloud, account, resource_type, instance_id, status, avg_cpu, max_cpu |
+| huawei_checks | 华为云巡检 | check_type, resource_type, risk_level, resource_id, detail |
+
+- `db.py` 使用 pymysql 短连接，每次操作创建/关闭连接
+- JSON 字段（tags, extra, scan_params）用 `json.dumps` / `json.loads` 序列化
+- `save_*` 操作按 cloud+account 或 check_type 先删后插（覆盖旧数据）
+
+## 5. 关键约束
+
+1. **中文输出** — 所有字段名、状态描述必须中文
+2. **异常隔离** — 单实例查询失败不影响整体报告
+3. **低利用率用表格** — 紧凑 Markdown 表格，一行一条
+4. **已停止用详情** — 多行 InstanceInfo.display()
+5. **不输出正常实例** — 仅计入概览数字

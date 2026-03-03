@@ -11,60 +11,19 @@ from claude_agent_sdk import (
 from cloud_monitor.config import AppConfig, AWSAccountConfig
 
 
+def _try_save_db(cloud: str, account: str, structured: list[dict], scan_params: dict | None = None):
+    """尝试将结构化数据写入 MongoDB（静默失败）"""
+    try:
+        from cloud_monitor.db import save_idle_resources, get_db
+        if get_db() is not None and structured:
+            save_idle_resources(cloud, account, structured, scan_params)
+    except Exception:
+        pass
+
+
 def build_tools(config: AppConfig) -> list:
     """根据配置动态构建已启用的云平台工具"""
     tools = []
-
-    # ── 华为云工具 ──
-    if config.huawei.enabled:
-        from cloud_monitor.tools.huawei import (
-            get_metric_data_huawei,
-            list_cdn_domains_huawei,
-            list_ecs_instances_huawei,
-            list_metrics_huawei,
-            list_obs_buckets_huawei,
-        )
-
-        hw_config = config.huawei
-
-        @tool(
-            "huawei_list_metrics",
-            "列出华为云可用的监控指标(ECS)。不传参数返回常用指标，可通过 namespace 和 metric_name 过滤",
-            {"namespace": str, "metric_name": str},
-        )
-        async def huawei_list_metrics_tool(args: dict[str, Any]) -> dict[str, Any]:
-            result = list_metrics_huawei(hw_config, namespace=args.get("namespace", ""), metric_name=args.get("metric_name", ""))
-            return {"content": [{"type": "text", "text": result}]}
-
-        @tool(
-            "huawei_get_metric_data",
-            "查询华为云指定实例的监控指标数据。需提供 namespace、metric_name、instance_id",
-            {"namespace": str, "metric_name": str, "instance_id": str, "period": int, "stat": str, "hours": float, "dim_name": str},
-        )
-        async def huawei_get_metric_data_tool(args: dict[str, Any]) -> dict[str, Any]:
-            result = get_metric_data_huawei(
-                hw_config, namespace=args["namespace"], metric_name=args["metric_name"], instance_id=args["instance_id"],
-                period=args.get("period", 300), stat=args.get("stat", "average"), hours=args.get("hours", 1), dim_name=args.get("dim_name", "instance_id"),
-            )
-            return {"content": [{"type": "text", "text": result}]}
-
-        @tool("huawei_list_ecs", "列出华为云 ECS 云主机实例（概览+已停止实例详情），与 AWS EC2 输出格式一致", {})
-        async def huawei_list_ecs_tool(args: dict[str, Any]) -> dict[str, Any]:
-            return {"content": [{"type": "text", "text": list_ecs_instances_huawei(hw_config)}]}
-
-        @tool("huawei_list_obs", "列出华为云 OBS 对象存储桶（含区域信息和区域分布统计），与 AWS S3 输出格式一致", {})
-        async def huawei_list_obs_tool(args: dict[str, Any]) -> dict[str, Any]:
-            return {"content": [{"type": "text", "text": list_obs_buckets_huawei(hw_config)}]}
-
-        @tool(
-            "huawei_list_cdn",
-            "列出华为云 CDN 加速域名（概览+已停用域名详情），与 AWS CloudFront 输出格式一致。status_filter: 'offline'=仅停用, 'online'=仅启用, ''=全部",
-            {"status_filter": str},
-        )
-        async def huawei_list_cdn_tool(args: dict[str, Any]) -> dict[str, Any]:
-            return {"content": [{"type": "text", "text": list_cdn_domains_huawei(hw_config, status_filter=args.get("status_filter", ""))}]}
-
-        tools.extend([huawei_list_metrics_tool, huawei_get_metric_data_tool, huawei_list_ecs_tool, huawei_list_obs_tool, huawei_list_cdn_tool])
 
     # ── 阿里云工具 ──
     if config.aliyun.enabled:
@@ -101,7 +60,9 @@ def build_tools(config: AppConfig) -> list:
 
         @tool("aliyun_list_ecs", "列出阿里云 ECS 云主机实例（概览+已停止实例详情），与 AWS EC2 输出格式一致", {})
         async def aliyun_list_ecs_tool(args: dict[str, Any]) -> dict[str, Any]:
-            return {"content": [{"type": "text", "text": list_ecs_instances_aliyun(ali_config)}]}
+            text, structured = list_ecs_instances_aliyun(ali_config)
+            _try_save_db("阿里云", "default", structured)
+            return {"content": [{"type": "text", "text": text}]}
 
         @tool("aliyun_list_oss", "列出阿里云 OSS 对象存储桶（含区域信息和区域分布统计），与 AWS S3 输出格式一致", {})
         async def aliyun_list_oss_tool(args: dict[str, Any]) -> dict[str, Any]:
@@ -138,7 +99,16 @@ def build_tools(config: AppConfig) -> list:
             accounts = _get_accounts(account_name)
             parts = []
             for acc in accounts:
-                parts.append(fn(acc, **kwargs))
+                result = fn(acc, **kwargs)
+                if isinstance(result, tuple):
+                    text, structured = result
+                    parts.append(text)
+                    _try_save_db("AWS", acc.name, structured,
+                                 {"cpu_threshold": kwargs.get("cpu_threshold"),
+                                  "mem_threshold": kwargs.get("mem_threshold"),
+                                  "hours": kwargs.get("hours")})
+                else:
+                    parts.append(result)
             return "\n\n".join(parts)
 
         @tool("aws_list_accounts", "列出所有已配置的 AWS 账户及其区域信息", {})
@@ -219,11 +189,6 @@ def build_allowed_tools(config: AppConfig) -> list[str]:
     allowed = []
     s = "cloud"
 
-    if config.huawei.enabled:
-        allowed.extend([f"mcp__{s}__{t}" for t in [
-            "huawei_list_metrics", "huawei_get_metric_data", "huawei_list_ecs", "huawei_list_obs", "huawei_list_cdn",
-        ]])
-
     if config.aliyun.enabled:
         allowed.extend([f"mcp__{s}__{t}" for t in [
             "aliyun_list_metrics", "aliyun_get_metric_data", "aliyun_list_ecs", "aliyun_list_oss", "aliyun_list_cdn",
@@ -240,24 +205,21 @@ def build_allowed_tools(config: AppConfig) -> list[str]:
 
 
 SYSTEM_PROMPT = """\
-你是一个多云治理监控助手，帮助用户统一掌握阿里云、华为云、AWS 三大云平台的资源使用情况、发现闲置浪费、优化云成本。
+你是一个多云治理监控助手，帮助用户掌握阿里云、AWS 云平台的资源使用情况、发现闲置浪费、优化云成本。
 
 # 工具映射
 
-多云监控助手提供的资源查询工具，格式保持一致：
-
-| 资源类型 | 阿里云 | 华为云 | AWS |
-|---------|--------|--------|-----|
-| 云主机   | aliyun_list_ecs | huawei_list_ecs | aws_ec2 |
-| 对象存储 | aliyun_list_oss | huawei_list_obs | aws_list_s3 |
-| CDN     | aliyun_list_cdn | huawei_list_cdn | - |
-| 指标列表 | aliyun_list_metrics | huawei_list_metrics | - |
-| 指标数据 | aliyun_get_metric_data | huawei_get_metric_data | - |
+| 资源类型 | 阿里云 | AWS |
+|---------|--------|-----|
+| 云主机   | aliyun_list_ecs | aws_ec2 |
+| 对象存储 | aliyun_list_oss | aws_list_s3 |
+| CDN     | aliyun_list_cdn | - |
+| 指标列表 | aliyun_list_metrics | - |
+| 指标数据 | aliyun_get_metric_data | - |
 
 AWS 独有工具：aws_list_accounts, aws_list_vpn, aws_vpn_status
 
 aws_ec2 是统一的 EC2 工具，一次调用返回全部结果：实例概览 + 已停止实例详情 + 低利用率实例表格。
-低利用率实例使用紧凑表格格式（一行一条），即使数量较多也不会导致上下文溢出。
 调用 aws_ec2 时**不需要传参数**，默认值已从配置文件加载。首次调用会扫描 CloudWatch（约1-2分钟），结果自动缓存。
 
 # 查询决策
@@ -265,10 +227,10 @@ aws_ec2 是统一的 EC2 工具，一次调用返回全部结果：实例概览 
 当用户查询"所有云"或未指定平台时，依次调用各启用平台的对应工具。
 当用户指定某个平台或服务时，只调用对应工具。
 
-- 查云主机 / 查闲置资源 / 查 EC2 → 调用 aws_ec2（不传参数即可），一次返回全部结果。低利用率实例已使用紧凑表格格式，直接完整输出给用户。阿里云用 aliyun_list_ecs，华为云用 huawei_list_ecs
-- 查对象存储 → 调用 *_list_oss / *_list_obs / aws_list_s3
-- 查 CDN → 调用 aliyun_list_cdn / huawei_list_cdn（AWS 暂不支持 CDN 查询）
-- 查 VPN → 调用 aws_list_vpn（自动列出所有VPN并查询每个VPN最近1小时每1分钟的带宽表格）。查特定VPN或自定义时间范围时用 aws_vpn_status
+- 查云主机 / 查闲置资源 / 查 EC2 → 调用 aws_ec2（不传参数即可）。阿里云用 aliyun_list_ecs
+- 查对象存储 → 调用 aliyun_list_oss / aws_list_s3
+- 查 CDN → 调用 aliyun_list_cdn
+- 查 VPN → 调用 aws_list_vpn 或 aws_vpn_status
 
 # AWS 多账户与多区域
 
@@ -276,13 +238,12 @@ aws_ec2 是统一的 EC2 工具，一次调用返回全部结果：实例概览 
 - EC2/S3 自动遍历账户配置的所有 regions
 - VPN 使用 vpn_region
 
-
 # 输出规范
 
-1. **必须且只能使用中文回答**，包括标题、表格、建议、小结等所有内容，严禁使用英文。数据必须附带单位
+1. **必须且只能使用中文回答**，数据必须附带单位
 2. 多云结果按平台分段展示，标注平台名称
-3. 已停止的实例和已禁用/停用的 CDN 必须逐条列出完整详情（ID、名称、类型、区域、停止时长等），禁止省略或合并
-4. **VPN 带宽数据**：工具返回的带宽趋势表格（每分钟一行）必须完整原样输出，禁止省略、合并或只输出小结。对有流量的 VPN，输出顺序为：最新采样点表格 → 每分钟趋势表格（全部行） → 小结。对无流量的 VPN（所有隧道 DOWN），只需简要说明即可
+3. 已停止的实例必须逐条列出完整详情，禁止省略或合并
+4. **VPN 带宽数据**：趋势表格必须完整原样输出，禁止省略
 5. 主动告警：VPN 隧道 DOWN
 6. 查询失败时说明原因并给出排查建议
 """
@@ -290,6 +251,13 @@ aws_ec2 是统一的 EC2 工具，一次调用返回全部结果：实例概览 
 
 def create_agent_options(config: AppConfig) -> ClaudeAgentOptions:
     """创建 Claude Agent 配置"""
+    if config.mysql.enabled:
+        try:
+            from cloud_monitor.db import init_db
+            init_db(config.mysql)
+        except Exception:
+            pass
+
     all_tools = build_tools(config)
 
     if not all_tools:
