@@ -24,7 +24,9 @@ from cloud_monitor.db import (
     save_idle_resources,
 )
 
-log = logging.getLogger("cloud_monitor.scheduler")
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
+log = logging.getLogger("cloud_monitor")
 
 app = FastAPI(title="Cloud Monitor", version="1.0.0")
 
@@ -38,52 +40,58 @@ app.add_middleware(
 _app_config: AppConfig | None = None
 
 
-def _run_ec2_job():
-    """执行 AWS EC2 巡检并写入 MySQL"""
+def _run_aws_single(check_type: str, params: dict, task_regions: list[str] | None = None):
+    """执行 AWS 单项巡检（遍历指定区域）并写入 MySQL"""
+    import time
     cfg = _app_config
     if cfg is None or not cfg.aws.enabled:
         return
     try:
-        from cloud_monitor.tools.aws import list_ec2_aws
-        ec2_cfg = cfg.ec2_check
-        scan_params = {
-            "cpu_threshold": ec2_cfg.cpu_threshold,
-            "mem_threshold": ec2_cfg.mem_threshold,
-            "hours": ec2_cfg.hours,
-        }
+        from cloud_monitor.tools.aws import run_single_aws_check, AWS_CHECK_NAMES
+
         for acc in cfg.aws.accounts:
-            log.info("EC2 巡检开始: 账户=%s", acc.name)
-            _, structured = list_ec2_aws(
-                acc,
-                cpu_threshold=ec2_cfg.cpu_threshold,
-                mem_threshold=ec2_cfg.mem_threshold,
-                hours=ec2_cfg.hours,
-                max_workers=ec2_cfg.max_workers,
-            )
-            if structured:
-                save_idle_resources("AWS", acc.name, structured, scan_params)
-                log.info("EC2 巡检完成: 账户=%s, 写入 %d 条", acc.name, len(structured))
-            else:
-                log.info("EC2 巡检完成: 账户=%s, 无数据写入", acc.name)
+            regions = task_regions if task_regions else acc.get_regions()
+            t0 = time.time()
+            log.info("[AWS巡检] 开始 | %s, 账户=%s, 区域(%d): %s",
+                     check_type, acc.name, len(regions), regions)
+            _, data = run_single_aws_check(acc, check_type, params, task_regions=task_regions)
+            elapsed = time.time() - t0
+            if check_type == "ec2" and data:
+                scan_params = {
+                    "cpu_threshold": params.get("cpu_threshold", 10.0),
+                    "mem_threshold": params.get("mem_threshold", 10.0),
+                    "hours": params.get("hours", 360),
+                }
+                save_idle_resources("AWS", acc.name, data, scan_params)
+            log.info("[AWS巡检] 完成 | %s, 账户=%s, 数据 %d 条, 耗时 %.1fs",
+                     check_type, acc.name, len(data), elapsed)
     except Exception:
-        log.exception("EC2 巡检异常")
+        log.exception("[AWS巡检] 异常 | %s", check_type)
 
 
-def _run_huawei_single(check_type: str, params: dict):
-    """执行华为云单项巡检（遍历所有区域）并写入 MySQL"""
+def _run_huawei_group(group_name: str, check_types: list[str], params: dict, task_regions: list[str] | None = None):
+    """执行华为云资源组巡检（同一资源的多个巡检项顺序执行）"""
+    import time
     cfg = _app_config
     if cfg is None or not cfg.huawei.enabled:
         return
-    try:
-        from cloud_monitor.tools.huawei_check import run_single_check_all_regions
+    from cloud_monitor.tools.huawei_check import run_single_check_all_regions
 
-        regions = cfg.huawei.get_regions()
-        log.info("华为云巡检开始: %s, 区域: %s", check_type, regions)
-        _, data = run_single_check_all_regions(cfg.huawei, check_type, params)
-        save_check_results(check_type, data)
-        log.info("华为云巡检完成: %s, 写入 %d 条", check_type, len(data))
-    except Exception:
-        log.exception("华为云巡检异常: %s", check_type)
+    regions = task_regions if task_regions else cfg.huawei.get_regions()
+    t0 = time.time()
+    log.info("[华为云巡检] 开始 | %s (%s), 区域(%d): %s",
+             group_name, ", ".join(check_types), len(regions), regions)
+    total_records = 0
+    for ct in check_types:
+        try:
+            _, data = run_single_check_all_regions(cfg.huawei, ct, params, task_regions=task_regions)
+            save_check_results(ct, data)
+            total_records += len(data)
+            log.info("[华为云巡检]   %s → %d 条", ct, len(data))
+        except Exception:
+            log.exception("[华为云巡检] 异常 | %s", ct)
+    elapsed = time.time() - t0
+    log.info("[华为云巡检] 完成 | %s, 共 %d 条, 耗时 %.1fs", group_name, total_records, elapsed)
 
 
 def _bg(fn, *args, name="job"):
@@ -109,42 +117,76 @@ def startup():
 
     job_count = 0
 
-    if config.aws.enabled and config.schedule.aws_ec2.enabled:
-        t = config.schedule.aws_ec2
+    for check_type, task in config.schedule.aws_checks.items():
+        if not task.enabled:
+            continue
+        if not config.aws.enabled:
+            log.warning("AWS 未启用, 跳过巡检: %s", check_type)
+            continue
+        p = task.params
+        tr = task.regions or None
         scheduler.add_job(
-            lambda: _bg(_run_ec2_job, name="ec2-job"),
-            trigger=CronTrigger(day_of_week=t.cron_day_of_week, hour=t.cron_hour),
-            id="aws_ec2", name="AWS EC2 巡检",
+            lambda ct=check_type, pa=p, rg=tr: _bg(_run_aws_single, ct, pa, rg, name=f"aws-{ct}"),
+            trigger=CronTrigger(day_of_week=task.cron_day_of_week, hour=task.cron_hour),
+            id=f"aws_{check_type}", name=f"AWS巡检: {check_type}",
         )
-        log.info("定时任务注册: AWS EC2 巡检, 每周%s %d:00", t.cron_day_of_week, t.cron_hour)
         job_count += 1
 
-    for check_type, task in config.schedule.huawei_checks.items():
+    for group_name, task in config.schedule.huawei_checks.items():
         if not task.enabled:
             continue
         if not config.huawei.enabled:
-            log.warning("华为云未启用, 跳过巡检: %s", check_type)
+            log.warning("华为云未启用, 跳过巡检: %s", group_name)
             continue
         p = task.params
+        tr = task.regions or None
+        cts = task.check_types if task.check_types else [group_name]
+        job_label = f"{group_name} ({', '.join(cts)})" if len(cts) > 1 else group_name
         scheduler.add_job(
-            lambda ct=check_type, pa=p: _bg(_run_huawei_single, ct, pa, name=f"hw-{ct}"),
+            lambda gn=group_name, ct=cts, pa=p, rg=tr: _bg(_run_huawei_group, gn, ct, pa, rg, name=f"hw-{gn}"),
             trigger=CronTrigger(day_of_week=task.cron_day_of_week, hour=task.cron_hour),
-            id=f"huawei_{check_type}", name=f"华为云巡检: {check_type}",
+            id=f"huawei_{group_name}", name=f"华为云巡检: {job_label}",
         )
-        log.info("定时任务注册: 华为云 %s, 每周%s %d:00", check_type, task.cron_day_of_week, task.cron_hour)
         job_count += 1
 
     if job_count > 0:
         scheduler.start()
-        log.info("定时任务调度器已启动: 共 %d 个任务", job_count)
+        log.info("=" * 60)
+        log.info("定时任务调度器已启动 (时区: Asia/Shanghai)")
+        log.info("已注册 %d 个定时任务:", job_count)
+        DAY_MAP = {"mon": "周一", "tue": "周二", "wed": "周三", "thu": "周四",
+                   "fri": "周五", "sat": "周六", "sun": "周日"}
+        region_info: dict[str, list[str]] = {}
+        default_aws_regions = config.aws.accounts[0].get_regions() if config.aws.accounts else []
+        for ct, t in config.schedule.aws_checks.items():
+            if t.enabled:
+                effective = t.regions if t.regions else default_aws_regions
+                region_info[f"aws_{ct}"] = effective
+        for gn, t in config.schedule.huawei_checks.items():
+            if t.enabled:
+                effective = t.regions if t.regions else config.huawei.get_regions()
+                region_info[f"huawei_{gn}"] = effective
+
+        for job in scheduler.get_jobs():
+            next_run = job.next_run_time.strftime("%Y-%m-%d %H:%M:%S %Z") if job.next_run_time else "未知"
+            regions = region_info.get(job.id)
+            if regions:
+                log.info("  [%s] %s | 区域(%d): %s | 下次执行: %s", job.id, job.name, len(regions), regions, next_run)
+            else:
+                log.info("  [%s] %s | 下次执行: %s", job.id, job.name, next_run)
+        log.info("=" * 60)
 
         if config.schedule.run_on_startup:
             log.info("服务启动: 立即执行首次巡检")
-            if config.aws.enabled and config.schedule.aws_ec2.enabled:
-                _bg(_run_ec2_job, name="ec2-startup")
-            for check_type, task in config.schedule.huawei_checks.items():
+            for check_type, task in config.schedule.aws_checks.items():
+                if task.enabled and config.aws.enabled:
+                    tr = task.regions or None
+                    _bg(_run_aws_single, check_type, task.params, tr, name=f"aws-{check_type}-startup")
+            for group_name, task in config.schedule.huawei_checks.items():
                 if task.enabled and config.huawei.enabled:
-                    _bg(_run_huawei_single, check_type, task.params, name=f"hw-{check_type}-startup")
+                    tr = task.regions or None
+                    cts = task.check_types if task.check_types else [group_name]
+                    _bg(_run_huawei_group, group_name, cts, task.params, tr, name=f"hw-{group_name}-startup")
 
 
 # ── AWS 巡检 API ──
@@ -231,19 +273,28 @@ def api_schedule_status():
         return {"enabled": False}
 
     tasks = []
-    if cfg.schedule.aws_ec2.enabled:
-        tasks.append({
-            "id": "aws_ec2", "name": "AWS EC2 巡检",
-            "cron_day_of_week": cfg.schedule.aws_ec2.cron_day_of_week,
-            "cron_hour": cfg.schedule.aws_ec2.cron_hour,
-        })
-    for ct, t in cfg.schedule.huawei_checks.items():
+    default_aws_regions = cfg.aws.accounts[0].get_regions() if cfg.aws.accounts else []
+    for ct, t in cfg.schedule.aws_checks.items():
         if t.enabled:
+            effective_regions = t.regions if t.regions else default_aws_regions
             tasks.append({
-                "id": f"huawei_{ct}", "name": f"华为云: {ct}",
+                "id": f"aws_{ct}", "name": f"AWS: {ct}",
                 "cron_day_of_week": t.cron_day_of_week,
                 "cron_hour": t.cron_hour,
                 "params": t.params,
+                "regions": effective_regions,
+            })
+    for gn, t in cfg.schedule.huawei_checks.items():
+        if t.enabled:
+            effective_regions = t.regions if t.regions else cfg.huawei.get_regions()
+            cts = t.check_types if t.check_types else [gn]
+            tasks.append({
+                "id": f"huawei_{gn}", "name": f"华为云: {gn}",
+                "check_types": cts,
+                "cron_day_of_week": t.cron_day_of_week,
+                "cron_hour": t.cron_hour,
+                "params": t.params,
+                "regions": effective_regions,
             })
 
     return {
@@ -254,8 +305,6 @@ def api_schedule_status():
 
 
 # ── 智能对话 API（SSE 流式返回，不推送 Webhook）──
-
-_chat_sessions: dict[str, object] = {}
 
 
 def _sse_event(event: str, data: dict) -> str:
@@ -278,9 +327,12 @@ async def api_chat(request: Request):
     if not session_id:
         session_id = str(uuid.uuid4())
 
+    import asyncio
+
     async def event_stream():
         yield _sse_event("session", {"session_id": session_id})
 
+        client = None
         try:
             from claude_agent_sdk import (
                 AssistantMessage,
@@ -291,46 +343,57 @@ async def api_chat(request: Request):
             )
             from cloud_monitor.agent import create_agent_options
 
-            if session_id in _chat_sessions:
-                client = _chat_sessions[session_id]
-            else:
-                options = create_agent_options(cfg)
-                client = ClaudeSDKClient(options=options)
-                await client.__aenter__()
-                _chat_sessions[session_id] = client
+            options = create_agent_options(cfg)
+            client = ClaudeSDKClient(options=options)
+            await client.__aenter__()
 
-            await client.query(message)
+            await client.query(message, session_id=session_id)
+
             async for msg in client.receive_response():
+                if await request.is_disconnected():
+                    log.info("客户端已断开, 终止对话")
+                    await client.interrupt()
+                    break
+
                 if isinstance(msg, AssistantMessage):
+                    has_tool_use = any(
+                        isinstance(b, ToolUseBlock) for b in msg.content
+                    )
                     for block in msg.content:
-                        if isinstance(block, TextBlock):
-                            yield _sse_event("text", {"text": block.text})
-                        elif isinstance(block, ToolUseBlock):
+                        if isinstance(block, ToolUseBlock):
                             params = {k: v for k, v in (block.input or {}).items()
                                       if v is not None and v != ""}
                             yield _sse_event("tool_call", {"name": block.name, "params": params})
+                        elif isinstance(block, TextBlock):
+                            if has_tool_use:
+                                continue
+                            yield _sse_event("text", {"text": block.text})
                 elif isinstance(msg, ResultMessage):
                     if msg.total_cost_usd and msg.total_cost_usd > 0:
                         yield _sse_event("cost", {"cost_usd": msg.total_cost_usd})
 
             yield _sse_event("done", {})
+        except asyncio.CancelledError:
+            log.info("对话请求被取消")
         except Exception as e:
-            log.exception("智能对话异常")
+            log.exception("Chat SSE error")
             yield _sse_event("error", {"error": str(e)})
+        finally:
+            if client:
+                try:
+                    await client.interrupt()
+                except Exception:
+                    pass
+                try:
+                    await client.__aexit__(None, None, None)
+                except Exception:
+                    pass
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @app.post("/api/chat/reset")
 async def api_chat_reset(request: Request):
-    body = await request.json()
-    session_id = body.get("session_id", "")
-    if session_id and session_id in _chat_sessions:
-        client = _chat_sessions.pop(session_id)
-        try:
-            await client.__aexit__(None, None, None)
-        except Exception:
-            pass
     return {"ok": True}
 
 

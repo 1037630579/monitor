@@ -913,3 +913,88 @@ def list_elb_aws(config: AWSAccountConfig) -> str:
         return f"{label}在区域 {region} 找到 {len(results)} 个负载均衡器:\n\n" + "\n\n".join(results)
     except Exception as e:
         return f"{label}AWS 查询负载均衡器失败: {e}\n{traceback.format_exc()}"
+
+
+# ──────────────── 统一巡检入口（供定时任务调用）────────────────
+
+AWS_CHECK_NAMES: dict[str, str] = {
+    "ec2": "EC2 闲置检测",
+    "vpn": "VPN 连接巡检",
+    "elb": "ALB 负载均衡巡检",
+    "s3": "S3 存储桶巡检",
+    "cloudfront": "CloudFront CDN 巡检",
+}
+
+
+def run_single_aws_check(
+    config: AWSAccountConfig,
+    check_type: str,
+    params: dict | None = None,
+    task_regions: list[str] | None = None,
+) -> tuple[str, list[dict]]:
+    """对单个 AWS 巡检项执行检查（供 server.py 定时任务调用）
+
+    Args:
+        config: AWS 账户配置
+        check_type: 巡检类型 (ec2/vpn/elb/s3/cloudfront)
+        params: 额外参数（如 cpu_threshold 等）
+        task_regions: 该巡检项独立配置的区域，为空时 fallback 到 config.get_regions()
+
+    Returns:
+        (text_report, structured_data)
+    """
+    params = params or {}
+    regions = task_regions if task_regions else config.get_regions()
+
+    if check_type == "ec2":
+        cpu_threshold = float(params.get("cpu_threshold", 10.0))
+        mem_threshold = float(params.get("mem_threshold", 10.0))
+        hours = float(params.get("hours", 360))
+        max_workers = int(params.get("max_workers", 20))
+
+        all_text: list[str] = []
+        all_data: list[dict] = []
+        for region in regions:
+            text, data = list_ec2_aws(
+                config, region=region,
+                cpu_threshold=cpu_threshold, mem_threshold=mem_threshold,
+                hours=hours, max_workers=max_workers,
+            )
+            all_text.append(text)
+            all_data.extend(data)
+        return "\n\n".join(all_text), all_data
+
+    elif check_type == "vpn":
+        all_text = []
+        for region in regions:
+            cfg_copy = AWSAccountConfig(
+                name=config.name, access_key_id=config.access_key_id,
+                secret_access_key=config.secret_access_key,
+                region=region, vpn_region=region,
+            )
+            text = list_vpn_connections_aws(cfg_copy)
+            all_text.append(text)
+        return "\n\n".join(all_text), []
+
+    elif check_type == "elb":
+        all_text = []
+        for region in regions:
+            cfg_copy = AWSAccountConfig(
+                name=config.name, access_key_id=config.access_key_id,
+                secret_access_key=config.secret_access_key,
+                region=region, elb_region=region,
+            )
+            text = list_elb_aws(cfg_copy)
+            all_text.append(text)
+        return "\n\n".join(all_text), []
+
+    elif check_type == "s3":
+        text = list_s3_buckets_aws(config)
+        return text, []
+
+    elif check_type == "cloudfront":
+        text = list_cloudfront_distributions_aws(config)
+        return text, []
+
+    else:
+        return f"未知的 AWS 巡检类型: {check_type}", []

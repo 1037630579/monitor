@@ -78,11 +78,74 @@ def build_tools(config: AppConfig) -> list:
 
         tools.extend([aliyun_list_metrics_tool, aliyun_get_metric_data_tool, aliyun_list_ecs_tool, aliyun_list_oss_tool, aliyun_list_cdn_tool])
 
+    # ── 华为云工具 ──
+    if config.huawei.enabled:
+        from cloud_monitor.tools.huawei_check import run_single_check_all_regions
+
+        hw_cfg = config.huawei
+
+        HUAWEI_RESOURCE_GROUPS: dict[str, list[str]] = {
+            "ecs": ["ecs_security_group", "ecs_idle"],
+            "rds": ["rds_ha", "rds_network_type", "rds_params_double_one"],
+            "cce": ["cce_workload_replica", "cce_node_pods"],
+            "dds": ["dds_network_type"],
+            "dms": ["dms_rabbitmq_cluster"],
+        }
+
+        def _run_huawei_group(check_types: list[str]) -> dict[str, Any]:
+            all_text: list[str] = []
+            for ct in check_types:
+                text, data = run_single_check_all_regions(hw_cfg, ct)
+                all_text.append(text)
+                try:
+                    from cloud_monitor.db import save_check_results, get_db
+                    if get_db() is not None and data:
+                        save_check_results(ct, data)
+                except Exception:
+                    pass
+            return {"content": [{"type": "text", "text": "\n\n".join(all_text)}]}
+
+        @tool("huawei_ecs", "华为云 ECS 巡检：安全组规则检查 + 闲置实例检查，一次返回全部结果", {})
+        async def huawei_ecs_tool(args: dict[str, Any]) -> dict[str, Any]:
+            return _run_huawei_group(HUAWEI_RESOURCE_GROUPS["ecs"])
+
+        @tool("huawei_rds", "华为云 RDS 巡检：高可用部署检查 + 网络类型检查 + 参数双1检查，一次返回全部结果", {})
+        async def huawei_rds_tool(args: dict[str, Any]) -> dict[str, Any]:
+            return _run_huawei_group(HUAWEI_RESOURCE_GROUPS["rds"])
+
+        @tool("huawei_cce", "华为云 CCE 巡检：工作负载副本数检查 + 节点 Pod 数量检查，一次返回全部结果", {})
+        async def huawei_cce_tool(args: dict[str, Any]) -> dict[str, Any]:
+            return _run_huawei_group(HUAWEI_RESOURCE_GROUPS["cce"])
+
+        @tool("huawei_dds", "华为云 DDS (MongoDB) 巡检：网络类型检查", {})
+        async def huawei_dds_tool(args: dict[str, Any]) -> dict[str, Any]:
+            return _run_huawei_group(HUAWEI_RESOURCE_GROUPS["dds"])
+
+        @tool("huawei_dms", "华为云 DMS 巡检：RabbitMQ 集群部署检查", {})
+        async def huawei_dms_tool(args: dict[str, Any]) -> dict[str, Any]:
+            return _run_huawei_group(HUAWEI_RESOURCE_GROUPS["dms"])
+
+        @tool("huawei_list_regions", "列出华为云已配置的所有巡检区域及对应的 project_id", {})
+        async def huawei_list_regions_tool(args: dict[str, Any]) -> dict[str, Any]:
+            regions = hw_cfg.get_regions()
+            lines = [f"华为云已配置 {len(regions)} 个区域:"]
+            for r in regions:
+                pid = hw_cfg.region_projects.get(r, "未知")
+                lines.append(f"  {r} → project_id: {pid}")
+            return {"content": [{"type": "text", "text": "\n".join(lines)}]}
+
+        tools.extend([
+            huawei_ecs_tool, huawei_rds_tool, huawei_cce_tool,
+            huawei_dds_tool, huawei_dms_tool, huawei_list_regions_tool,
+        ])
+
     # ── AWS 工具（多账户 / 多区域）──
     if config.aws.enabled:
         from cloud_monitor.tools.aws import (
             get_vpn_status_aws,
             list_ec2_aws,
+            list_elb_aws,
+            list_cloudfront_distributions_aws,
             list_s3_buckets_aws,
             list_vpn_connections_aws,
         )
@@ -110,18 +173,6 @@ def build_tools(config: AppConfig) -> list:
                 else:
                     parts.append(result)
             return "\n\n".join(parts)
-
-        @tool("aws_list_accounts", "列出所有已配置的 AWS 账户及其区域信息", {})
-        async def aws_list_accounts_tool(args: dict[str, Any]) -> dict[str, Any]:
-            lines = [f"已配置 {len(aws_cfg.accounts)} 个 AWS 账户:"]
-            for acc in aws_cfg.accounts:
-                lines.append(f"\n  账户: {acc.name}")
-                lines.append(f"    默认区域: {acc.region}")
-                if acc.regions:
-                    lines.append(f"    多区域: {', '.join(acc.regions)}")
-                if acc.vpn_region:
-                    lines.append(f"    VPN区域: {acc.vpn_region}")
-            return {"content": [{"type": "text", "text": "\n".join(lines)}]}
 
         ec2_days = ec2_cfg.hours / 24
         ec2_time_desc = f"{ec2_days:.0f}天" if ec2_cfg.hours >= 48 else f"{ec2_cfg.hours:.0f}小时"
@@ -173,12 +224,30 @@ def build_tools(config: AppConfig) -> list:
             result = get_vpn_status_aws(acc, vpn_id=args.get("vpn_id", ""), hours=args.get("hours", 1), period=args.get("period", 60))
             return {"content": [{"type": "text", "text": result}]}
 
+        # ── ALB 负载均衡 ──
+        @tool("aws_list_elb", "列出 AWS ALB 负载均衡器。account: 账户名(空=所有账户)", {"account": str})
+        async def aws_list_elb_tool(args: dict[str, Any]) -> dict[str, Any]:
+            result = _run_for_accounts(args.get("account", ""), list_elb_aws)
+            return {"content": [{"type": "text", "text": result}]}
+
+        # ── CloudFront CDN ──
+        @tool(
+            "aws_list_cloudfront",
+            "列出 AWS CloudFront CDN 分发概览（含已启用和已禁用分发详情）。account: 账户名(空=所有账户)。status_filter: 'disabled'=仅禁用, 'enabled'=仅启用, ''=全部",
+            {"account": str, "status_filter": str},
+        )
+        async def aws_list_cloudfront_tool(args: dict[str, Any]) -> dict[str, Any]:
+            result = _run_for_accounts(args.get("account", ""), list_cloudfront_distributions_aws,
+                                       status_filter=args.get("status_filter", ""))
+            return {"content": [{"type": "text", "text": result}]}
+
         tools.extend([
-            aws_list_accounts_tool,
             aws_ec2_tool,
             aws_list_s3_tool,
             aws_list_vpn_tool,
             aws_vpn_status_tool,
+            aws_list_elb_tool,
+            aws_list_cloudfront_tool,
         ])
 
     return tools
@@ -189,6 +258,12 @@ def build_allowed_tools(config: AppConfig) -> list[str]:
     allowed = []
     s = "cloud"
 
+    if config.huawei.enabled:
+        allowed.extend([f"mcp__{s}__{t}" for t in [
+            "huawei_ecs", "huawei_rds", "huawei_cce",
+            "huawei_dds", "huawei_dms", "huawei_list_regions",
+        ]])
+
     if config.aliyun.enabled:
         allowed.extend([f"mcp__{s}__{t}" for t in [
             "aliyun_list_metrics", "aliyun_get_metric_data", "aliyun_list_ecs", "aliyun_list_oss", "aliyun_list_cdn",
@@ -196,47 +271,69 @@ def build_allowed_tools(config: AppConfig) -> list[str]:
 
     if config.aws.enabled:
         allowed.extend([f"mcp__{s}__{t}" for t in [
-            "aws_list_accounts",
             "aws_ec2", "aws_list_s3",
             "aws_list_vpn", "aws_vpn_status",
+            "aws_list_elb", "aws_list_cloudfront",
         ]])
 
     return allowed
 
 
 SYSTEM_PROMPT = """\
-你是一个多云治理监控助手，帮助用户掌握阿里云、AWS 云平台的资源使用情况、发现闲置浪费、优化云成本。
+你是一个多云治理监控专家，帮助用户掌握华为云、阿里云、AWS 云平台的资源使用情况、发现闲置浪费、优化云成本。
 
 # 工具映射
 
-| 资源类型 | 阿里云 | AWS |
-|---------|--------|-----|
-| 云主机   | aliyun_list_ecs | aws_ec2 |
-| 对象存储 | aliyun_list_oss | aws_list_s3 |
-| CDN     | aliyun_list_cdn | - |
-| 指标列表 | aliyun_list_metrics | - |
-| 指标数据 | aliyun_get_metric_data | - |
+| 资源类型 | 华为云 | 阿里云 | AWS |
+|---------|--------|--------|-----|
+| ECS 云主机 | huawei_ecs | aliyun_list_ecs | aws_ec2 |
+| RDS 数据库 | huawei_rds | - | - |
+| CCE 容器 | huawei_cce | - | - |
+| DDS 数据库 | huawei_dds | - | - |
+| DMS 消息队列 | huawei_dms | - | - |
+| 对象存储 | - | aliyun_list_oss | aws_list_s3 |
+| CDN | - | aliyun_list_cdn | aws_list_cloudfront |
+| 负载均衡 | - | - | aws_list_elb |
+| VPN | - | - | aws_list_vpn / aws_vpn_status |
+| 区域信息 | huawei_list_regions | - | - |
 
-AWS 独有工具：aws_list_accounts, aws_list_vpn, aws_vpn_status
+# 华为云巡检
 
-aws_ec2 是统一的 EC2 工具，一次调用返回全部结果：实例概览 + 已停止实例详情 + 低利用率实例表格。
-调用 aws_ec2 时**不需要传参数**，默认值已从配置文件加载。首次调用会扫描 CloudWatch（约1-2分钟），结果自动缓存。
+每个工具一次调用返回该资源的全部巡检结果：
+- huawei_ecs: 安全组规则 + 闲置实例
+- huawei_rds: 高可用部署 + 网络类型 + 参数双1
+- huawei_cce: 工作负载副本数 + 节点 Pod 数量
+- huawei_dds: 网络类型
+- huawei_dms: RabbitMQ 集群部署
+
+# AWS 工具
+
+- aws_ec2: EC2 统一查询（概览 + 已停止 + 低利用率），不传参数即可
+- aws_list_s3: S3 存储桶列表
+- aws_list_vpn / aws_vpn_status: VPN 连接和带宽详情
+- aws_list_elb: ALB 负载均衡器列表
+- aws_list_cloudfront: CloudFront CDN 分发概览
 
 # 查询决策
 
 当用户查询"所有云"或未指定平台时，依次调用各启用平台的对应工具。
 当用户指定某个平台或服务时，只调用对应工具。
 
-- 查云主机 / 查闲置资源 / 查 EC2 → 调用 aws_ec2（不传参数即可）。阿里云用 aliyun_list_ecs
-- 查对象存储 → 调用 aliyun_list_oss / aws_list_s3
-- 查 CDN → 调用 aliyun_list_cdn
-- 查 VPN → 调用 aws_list_vpn 或 aws_vpn_status
+- 华为云 ECS → huawei_ecs
+- 华为云 RDS → huawei_rds
+- 华为云 CCE → huawei_cce
+- 华为云 DDS → huawei_dds
+- 华为云 DMS → huawei_dms
+- 查 EC2 / 查闲置 → aws_ec2（阿里云用 aliyun_list_ecs）
+- 查对象存储 → aliyun_list_oss / aws_list_s3
+- 查 CDN → aliyun_list_cdn / aws_list_cloudfront
+- 查负载均衡 → aws_list_elb
+- 查 VPN → aws_list_vpn 或 aws_vpn_status
 
-# AWS 多账户与多区域
+# 多账户与多区域
 
 - 每个 AWS 工具都有 account 参数，不传 = 查询所有账户
-- EC2/S3 自动遍历账户配置的所有 regions
-- VPN 使用 vpn_region
+- 华为云巡检自动遍历配置的所有区域
 
 # 输出规范
 
@@ -244,7 +341,7 @@ aws_ec2 是统一的 EC2 工具，一次调用返回全部结果：实例概览 
 2. 多云结果按平台分段展示，标注平台名称
 3. 已停止的实例必须逐条列出完整详情，禁止省略或合并
 4. **VPN 带宽数据**：趋势表格必须完整原样输出，禁止省略
-5. 主动告警：VPN 隧道 DOWN
+5. 主动告警：VPN 隧道 DOWN、安全组高风险规则
 6. 查询失败时说明原因并给出排查建议
 """
 
@@ -275,12 +372,7 @@ def create_agent_options(config: AppConfig) -> ClaudeAgentOptions:
     cloud_names = {"huawei": "华为云", "aliyun": "阿里云", "aws": "AWS"}
     enabled_str = "、".join(cloud_names.get(c, c) for c in enabled)
 
-    extra_info = ""
-    if config.aws.enabled and config.aws.accounts:
-        names = config.aws.list_account_names()
-        extra_info = f"\nAWS 已配置账户: {', '.join(names)}"
-
-    system = SYSTEM_PROMPT + f"\n\n当前已启用的云平台：{enabled_str}{extra_info}"
+    system = SYSTEM_PROMPT + f"\n\n当前已启用的云平台：{enabled_str}"
 
     options = ClaudeAgentOptions(
         system_prompt=system,

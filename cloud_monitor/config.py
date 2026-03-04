@@ -119,6 +119,8 @@ class TaskSchedule:
     enabled: bool = True
     cron_day_of_week: str = "mon"
     cron_hour: int = 2
+    regions: list[str] = field(default_factory=list)
+    check_types: list[str] = field(default_factory=list)
     params: dict = field(default_factory=dict)
 
 
@@ -127,7 +129,7 @@ class ScheduleConfig:
     """定时巡检配置"""
     enabled: bool = False
     run_on_startup: bool = True
-    aws_ec2: TaskSchedule = field(default_factory=TaskSchedule)
+    aws_checks: dict[str, TaskSchedule] = field(default_factory=dict)
     huawei_checks: dict[str, TaskSchedule] = field(default_factory=dict)
 
 
@@ -245,30 +247,34 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
 
         sch = data.get("schedule", {})
         if sch:
-            aws_ec2_raw = sch.get("aws_ec2", {})
-            aws_ec2_task = TaskSchedule(
-                enabled=aws_ec2_raw.get("enabled", True),
-                cron_day_of_week=str(aws_ec2_raw.get("cron_day_of_week", "mon")),
-                cron_hour=int(aws_ec2_raw.get("cron_hour", 2)),
-            )
-
-            huawei_tasks: dict[str, TaskSchedule] = {}
-            for check_type, check_cfg in sch.get("huawei_checks", {}).items():
-                if isinstance(check_cfg, dict):
-                    params = {k: v for k, v in check_cfg.items()
-                              if k not in ("enabled", "cron_day_of_week", "cron_hour")}
-                    huawei_tasks[check_type] = TaskSchedule(
-                        enabled=check_cfg.get("enabled", True),
-                        cron_day_of_week=str(check_cfg.get("cron_day_of_week", "mon")),
-                        cron_hour=int(check_cfg.get("cron_hour", 2)),
-                        params=params,
-                    )
+            def _parse_task_dict(section: dict) -> dict[str, TaskSchedule]:
+                tasks: dict[str, TaskSchedule] = {}
+                for check_type, check_cfg in section.items():
+                    if isinstance(check_cfg, dict):
+                        reserved_keys = {"enabled", "cron_day_of_week", "cron_hour", "regions", "check_types"}
+                        params = {k: v for k, v in check_cfg.items()
+                                  if k not in reserved_keys}
+                        task_regions = check_cfg.get("regions", [])
+                        if isinstance(task_regions, str):
+                            task_regions = [r.strip() for r in task_regions.split(",") if r.strip()]
+                        check_types = check_cfg.get("check_types", [])
+                        if isinstance(check_types, str):
+                            check_types = [c.strip() for c in check_types.split(",") if c.strip()]
+                        tasks[check_type] = TaskSchedule(
+                            enabled=check_cfg.get("enabled", True),
+                            cron_day_of_week=str(check_cfg.get("cron_day_of_week", "mon")),
+                            cron_hour=int(check_cfg.get("cron_hour", 2)),
+                            regions=task_regions,
+                            check_types=check_types,
+                            params=params,
+                        )
+                return tasks
 
             cfg.schedule = ScheduleConfig(
                 enabled=sch.get("enabled", False),
                 run_on_startup=sch.get("run_on_startup", True),
-                aws_ec2=aws_ec2_task,
-                huawei_checks=huawei_tasks,
+                aws_checks=_parse_task_dict(sch.get("aws_checks", {})),
+                huawei_checks=_parse_task_dict(sch.get("huawei_checks", {})),
             )
 
     # 环境变量覆盖

@@ -20,6 +20,13 @@ export function sendChatMessage(
   callbacks: ChatCallbacks,
 ): AbortController {
   const controller = new AbortController()
+  let finished = false
+
+  function finish() {
+    if (finished) return
+    finished = true
+    callbacks.onDone?.()
+  }
 
   fetch('/api/chat', {
     method: 'POST',
@@ -76,7 +83,7 @@ export function sendChatMessage(
                 callbacks.onError?.(parsed.error)
                 break
               case 'done':
-                callbacks.onDone?.()
+                finish()
                 break
             }
           } catch {
@@ -90,7 +97,7 @@ export function sendChatMessage(
         return reader!.read().then(({ done, value }) => {
           if (done) {
             if (buffer) processLines('\n')
-            callbacks.onDone?.()
+            finish()
             return
           }
           processLines(decoder.decode(value, { stream: true }))

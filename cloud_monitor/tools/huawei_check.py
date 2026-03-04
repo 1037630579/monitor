@@ -849,8 +849,13 @@ def run_single_check_all_regions(
     config: HuaweiCloudConfig,
     check_type: str,
     params: dict | None = None,
+    task_regions: list[str] | None = None,
 ) -> tuple[str, list[dict]]:
-    """对单个巡检项遍历所有区域执行（供 server.py 定时任务调用）"""
+    """对单个巡检项遍历区域执行（供 server.py 定时任务调用）
+
+    Args:
+        task_regions: 该巡检项独立配置的区域列表，为空时 fallback 到全局 regions
+    """
     check_fn = None
     for ct, _, fn in ALL_CHECKS:
         if ct == check_type:
@@ -867,7 +872,7 @@ def run_single_check_all_regions(
     elif check_type == "cce_node_pods":
         kwargs["pod_threshold"] = int(params.get("pod_threshold", 110))
 
-    regions = config.get_regions()
+    regions = task_regions if task_regions else config.get_regions()
     all_text: list[str] = []
     all_data: list[dict] = []
 

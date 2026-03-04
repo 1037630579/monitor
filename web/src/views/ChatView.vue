@@ -14,7 +14,7 @@
       <div v-if="messages.length === 0" class="chat-welcome">
         <el-icon :size="48" color="#409eff"><Monitor /></el-icon>
         <h3>多云统一监控助手</h3>
-        <p>输入自然语言查询云平台监控指标，支持 AWS、阿里云等多云平台</p>
+        <p>输入自然语言查询云平台监控指标，支持 AWS、华为云、阿里云等多云平台</p>
         <div class="quick-actions">
           <el-tag
             v-for="q in quickQueries"
@@ -127,20 +127,49 @@ interface ChatMessage {
   webhookOk?: boolean
 }
 
-const messages = ref<ChatMessage[]>([])
+const STORAGE_KEY = 'cloud_monitor_chat'
+
+function loadFromStorage(): { messages: ChatMessage[]; sessionId: string } {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (raw) {
+      const data = JSON.parse(raw)
+      return { messages: data.messages || [], sessionId: data.sessionId || '' }
+    }
+  } catch { /* ignore */ }
+  return { messages: [], sessionId: '' }
+}
+
+function saveToStorage() {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      messages: messages.value,
+      sessionId: sessionId.value,
+    }))
+  } catch { /* ignore */ }
+}
+
+const stored = loadFromStorage()
+const messages = ref<ChatMessage[]>(stored.messages)
 const inputText = ref('')
 const loading = ref(false)
-const sessionId = ref('')
+const sessionId = ref(stored.sessionId)
 const messagesRef = ref<HTMLElement>()
 const streamText = ref('')
 const streamToolCalls = ref<ToolCall[]>([])
 let abortController: AbortController | null = null
 
 const quickQueries = [
+  '华为云 ECS 巡检',
+  '华为云 RDS 巡检',
+  '华为云 CCE 巡检',
+  '华为云 DDS 巡检',
+  '华为云 DMS 巡检',
   '查询 AWS EC2',
-  '查看 AWS S3 存储桶',
-  '查询 VPN 状态',
-  '查看所有 AWS 账户',
+  '查看 AWS S3',
+  '查询 AWS VPN',
+  '查看 AWS ALB',
+  '查看 AWS CloudFront',
 ]
 
 const streamHtml = computed(() => {
@@ -174,6 +203,11 @@ function handleQuickQuery(q: string) {
 function handleSend() {
   const text = inputText.value.trim()
   if (!text || loading.value) return
+
+  if (abortController) {
+    abortController.abort()
+    abortController = null
+  }
 
   messages.value.push({ role: 'user', text })
   inputText.value = ''
@@ -218,6 +252,7 @@ function handleSend() {
         text: `查询出错: ${err}`,
         html: `<p style="color:#f56c6c">查询出错: ${err}</p>`,
       })
+      saveToStorage()
       scrollToBottom()
     },
     onDone() {
@@ -240,6 +275,7 @@ function handleSend() {
       }
       streamText.value = ''
       streamToolCalls.value = []
+      saveToStorage()
       scrollToBottom()
     },
   })
@@ -264,6 +300,7 @@ async function handleReset() {
   messages.value = []
   streamText.value = ''
   streamToolCalls.value = []
+  saveToStorage()
 }
 </script>
 
