@@ -1,11 +1,14 @@
 """配置管理 - 加载和验证多云平台凭证"""
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 import yaml
+
+_log = logging.getLogger("cloud_monitor.config")
 
 
 @dataclass
@@ -15,6 +18,22 @@ class HuaweiCloudConfig:
     sk: str = ""
     project_id: str = ""
     region: str = "cn-north-4"
+    regions: list[str] = field(default_factory=list)
+    region_projects: dict[str, str] = field(default_factory=dict)
+
+    def get_regions(self) -> list[str]:
+        """返回需要巡检的区域列表"""
+        return self.regions if self.regions else [self.region]
+
+    def for_region(self, region: str) -> "HuaweiCloudConfig":
+        """返回指定区域的 config 副本（自动匹配 project_id）"""
+        pid = self.region_projects.get(region, "")
+        if not pid and region == self.region:
+            pid = self.project_id
+        return HuaweiCloudConfig(
+            enabled=self.enabled, ak=self.ak, sk=self.sk,
+            project_id=pid, region=region,
+        )
 
 
 @dataclass
@@ -96,9 +115,10 @@ class MySQLConfig:
 
 @dataclass
 class TaskSchedule:
-    """单个定时任务配置"""
+    """单个定时任务配置 — 使用 cron 调度（默认每周一凌晨2点）"""
     enabled: bool = True
-    interval_hours: int = 168
+    cron_day_of_week: str = "mon"
+    cron_hour: int = 2
     params: dict = field(default_factory=dict)
 
 
@@ -164,12 +184,16 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
             data = yaml.safe_load(f) or {}
 
         hw = data.get("huawei", {})
+        hw_regions_raw = hw.get("regions", [])
+        if isinstance(hw_regions_raw, str):
+            hw_regions_raw = [r.strip() for r in hw_regions_raw.split(",") if r.strip()]
         cfg.huawei = HuaweiCloudConfig(
             enabled=hw.get("enabled", False),
-            ak=hw.get("ak", ""),
-            sk=hw.get("sk", ""),
+            ak=hw.get("ak", "") or hw.get("access_key_id", ""),
+            sk=hw.get("sk", "") or hw.get("secret_access_key", ""),
             project_id=hw.get("project_id", ""),
             region=hw.get("region", "cn-north-4"),
+            regions=hw_regions_raw,
         )
 
         ali = data.get("aliyun", {})
@@ -224,17 +248,19 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
             aws_ec2_raw = sch.get("aws_ec2", {})
             aws_ec2_task = TaskSchedule(
                 enabled=aws_ec2_raw.get("enabled", True),
-                interval_hours=int(aws_ec2_raw.get("interval_hours", 168)),
+                cron_day_of_week=str(aws_ec2_raw.get("cron_day_of_week", "mon")),
+                cron_hour=int(aws_ec2_raw.get("cron_hour", 2)),
             )
 
             huawei_tasks: dict[str, TaskSchedule] = {}
             for check_type, check_cfg in sch.get("huawei_checks", {}).items():
                 if isinstance(check_cfg, dict):
                     params = {k: v for k, v in check_cfg.items()
-                              if k not in ("enabled", "interval_hours")}
+                              if k not in ("enabled", "cron_day_of_week", "cron_hour")}
                     huawei_tasks[check_type] = TaskSchedule(
                         enabled=check_cfg.get("enabled", True),
-                        interval_hours=int(check_cfg.get("interval_hours", 168)),
+                        cron_day_of_week=str(check_cfg.get("cron_day_of_week", "mon")),
+                        cron_hour=int(check_cfg.get("cron_hour", 2)),
                         params=params,
                     )
 
@@ -278,4 +304,35 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
         cfg.webhook.url = v
         cfg.webhook.enabled = True
 
+    if cfg.huawei.enabled and cfg.huawei.ak and cfg.huawei.get_regions():
+        cfg.huawei.region_projects = _fetch_huawei_region_projects(cfg.huawei)
+
     return cfg
+
+
+def _fetch_huawei_region_projects(hw: HuaweiCloudConfig) -> dict[str, str]:
+    """通过 IAM API 自动查询所有区域的 project_id 映射"""
+    try:
+        from huaweicloudsdkcore.auth.credentials import GlobalCredentials
+        from huaweicloudsdkiam.v3 import IamClient
+        from huaweicloudsdkiam.v3.model import KeystoneListProjectsRequest
+        from huaweicloudsdkiam.v3.region.iam_region import IamRegion
+
+        credentials = GlobalCredentials(hw.ak, hw.sk)
+        client = (
+            IamClient.new_builder()
+            .with_credentials(credentials)
+            .with_region(IamRegion.value_of(hw.region))
+            .build()
+        )
+        resp = client.keystone_list_projects(KeystoneListProjectsRequest())
+        mapping = {p.name: p.id for p in resp.projects}
+        needed = hw.get_regions()
+        result = {r: mapping[r] for r in needed if r in mapping}
+        _log.info("华为云 region→project_id: %s", result)
+        return result
+    except Exception as e:
+        _log.warning("自动获取华为云 project_id 失败: %s", e)
+        if hw.project_id and hw.region:
+            return {hw.region: hw.project_id}
+        return {}

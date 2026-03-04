@@ -183,9 +183,10 @@ def direct_huawei_check(config_path: str | None = None,
     if checks:
         check_names = [name for ctype, name, _ in ALL_CHECKS if ctype in checks]
 
+    regions = config.huawei.get_regions()
     console.print(Panel(
         f"[bold]华为云风险巡检[/bold]\n"
-        f"区域: {config.huawei.region}  |  巡检项: {len(check_names)} 个\n"
+        f"区域: {', '.join(regions)}  |  巡检项: {len(check_names)} 个\n"
         f"[dim]{'、'.join(check_names)}[/dim]\n"
         f"[dim]MySQL: {'已启用' if db_ok else '未启用'}[/dim]",
         border_style="cyan",

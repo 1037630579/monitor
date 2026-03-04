@@ -2,6 +2,117 @@ import axios from 'axios'
 
 const api = axios.create({ baseURL: '/api' })
 
+// ── 实时对话 ──
+
+export interface ChatCallbacks {
+  onSession?: (sessionId: string) => void
+  onText?: (text: string) => void
+  onToolCall?: (name: string, params: Record<string, any>) => void
+  onCost?: (costUsd: number) => void
+  onWebhook?: (success: boolean) => void
+  onError?: (error: string) => void
+  onDone?: () => void
+}
+
+export function sendChatMessage(
+  message: string,
+  sessionId: string,
+  callbacks: ChatCallbacks,
+): AbortController {
+  const controller = new AbortController()
+
+  fetch('/api/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message, session_id: sessionId }),
+    signal: controller.signal,
+  })
+    .then((response) => {
+      const reader = response.body?.getReader()
+      if (!reader) return
+
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      function processLines(text: string) {
+        buffer += text
+        const lines = buffer.split(/\r\n|\r|\n/)
+        buffer = lines.pop() || ''
+
+        let currentEvent = ''
+        for (const rawLine of lines) {
+          const line = rawLine.trim()
+          if (!line) {
+            currentEvent = ''
+            continue
+          }
+          if (line.startsWith(':')) continue
+          if (line.startsWith('event:')) {
+            currentEvent = line.slice(6).trim()
+            continue
+          }
+          if (!line.startsWith('data:') || !currentEvent) continue
+
+          const data = line.slice(5).trim()
+          try {
+            const parsed = JSON.parse(data)
+            switch (currentEvent) {
+              case 'session':
+                callbacks.onSession?.(parsed.session_id)
+                break
+              case 'text':
+                callbacks.onText?.(parsed.text)
+                break
+              case 'tool_call':
+                callbacks.onToolCall?.(parsed.name, parsed.params)
+                break
+              case 'cost':
+                callbacks.onCost?.(parsed.cost_usd)
+                break
+              case 'webhook':
+                callbacks.onWebhook?.(parsed.success)
+                break
+              case 'error':
+                callbacks.onError?.(parsed.error)
+                break
+              case 'done':
+                callbacks.onDone?.()
+                break
+            }
+          } catch {
+            // ignore malformed JSON
+          }
+          currentEvent = ''
+        }
+      }
+
+      function pump(): Promise<void> {
+        return reader!.read().then(({ done, value }) => {
+          if (done) {
+            if (buffer) processLines('\n')
+            callbacks.onDone?.()
+            return
+          }
+          processLines(decoder.decode(value, { stream: true }))
+          return pump()
+        })
+      }
+
+      return pump()
+    })
+    .catch((err) => {
+      if (err.name !== 'AbortError') {
+        callbacks.onError?.(err.message)
+      }
+    })
+
+  return controller
+}
+
+export async function resetChatSession(sessionId: string): Promise<void> {
+  await api.post('/chat/reset', { session_id: sessionId })
+}
+
 // ── AWS 巡检 ──
 
 export interface AwsResource {

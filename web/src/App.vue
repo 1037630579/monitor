@@ -2,6 +2,10 @@
   <el-config-provider :locale="zhCn">
     <div class="app-nav">
       <el-menu mode="horizontal" :default-active="activeTab" @select="activeTab = $event">
+        <el-menu-item index="chat">
+          <el-icon><ChatDotRound /></el-icon>
+          智能对话
+        </el-menu-item>
         <el-menu-item index="aws">
           <el-icon><Odometer /></el-icon>
           AWS 巡检
@@ -12,7 +16,8 @@
         </el-menu-item>
       </el-menu>
     </div>
-    <Dashboard v-if="activeTab === 'aws'" />
+    <ChatView v-if="activeTab === 'chat'" />
+    <Dashboard v-else-if="activeTab === 'aws'" />
     <HuaweiCheck v-else-if="activeTab === 'huawei-check'" />
   </el-config-provider>
 </template>
@@ -20,10 +25,11 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import zhCn from 'element-plus/es/locale/lang/zh-cn'
+import ChatView from './views/ChatView.vue'
 import Dashboard from './views/Dashboard.vue'
 import HuaweiCheck from './views/HuaweiCheck.vue'
 
-const activeTab = ref('aws')
+const activeTab = ref('chat')
 </script>
 
 <style>

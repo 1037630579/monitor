@@ -1,13 +1,15 @@
-"""FastAPI 服务 — AWS 巡检 + 华为云巡检 API + 前端静态文件托管 + 定时巡检"""
+"""FastAPI 服务 — AWS 巡检 + 华为云巡检 API + 智能对话 + 前端静态文件托管 + 定时巡检"""
 
+import json
 import logging
 import threading
+import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 from cloud_monitor.config import AppConfig, load_config
 from cloud_monitor.db import (
@@ -68,30 +70,16 @@ def _run_ec2_job():
 
 
 def _run_huawei_single(check_type: str, params: dict):
-    """执行华为云单项巡检并写入 MySQL"""
+    """执行华为云单项巡检（遍历所有区域）并写入 MySQL"""
     cfg = _app_config
     if cfg is None or not cfg.huawei.enabled:
         return
     try:
-        from cloud_monitor.tools.huawei_check import ALL_CHECKS
-        check_fn = None
-        for ct, _, fn in ALL_CHECKS:
-            if ct == check_type:
-                check_fn = fn
-                break
-        if check_fn is None:
-            log.warning("未知的华为云巡检类型: %s", check_type)
-            return
+        from cloud_monitor.tools.huawei_check import run_single_check_all_regions
 
-        log.info("华为云巡检开始: %s", check_type)
-        kwargs: dict = {}
-        if check_type == "ecs_idle":
-            kwargs["cpu_threshold"] = float(params.get("cpu_threshold", 5.0))
-            kwargs["days"] = int(params.get("idle_days", 10))
-        elif check_type == "cce_node_pods":
-            kwargs["pod_threshold"] = int(params.get("pod_threshold", 110))
-
-        _, data = check_fn(cfg.huawei, **kwargs)
+        regions = cfg.huawei.get_regions()
+        log.info("华为云巡检开始: %s, 区域: %s", check_type, regions)
+        _, data = run_single_check_all_regions(cfg.huawei, check_type, params)
         save_check_results(check_type, data)
         log.info("华为云巡检完成: %s, 写入 %d 条", check_type, len(data))
     except Exception:
@@ -116,18 +104,19 @@ def startup():
         return
 
     from apscheduler.schedulers.background import BackgroundScheduler
-    scheduler = BackgroundScheduler(timezone="UTC")
+    from apscheduler.triggers.cron import CronTrigger
+    scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
 
     job_count = 0
 
     if config.aws.enabled and config.schedule.aws_ec2.enabled:
-        h = config.schedule.aws_ec2.interval_hours
+        t = config.schedule.aws_ec2
         scheduler.add_job(
             lambda: _bg(_run_ec2_job, name="ec2-job"),
-            trigger="interval", hours=h,
+            trigger=CronTrigger(day_of_week=t.cron_day_of_week, hour=t.cron_hour),
             id="aws_ec2", name="AWS EC2 巡检",
         )
-        log.info("定时任务注册: AWS EC2 巡检, 每 %d 小时", h)
+        log.info("定时任务注册: AWS EC2 巡检, 每周%s %d:00", t.cron_day_of_week, t.cron_hour)
         job_count += 1
 
     for check_type, task in config.schedule.huawei_checks.items():
@@ -136,14 +125,13 @@ def startup():
         if not config.huawei.enabled:
             log.warning("华为云未启用, 跳过巡检: %s", check_type)
             continue
-        h = task.interval_hours
         p = task.params
         scheduler.add_job(
             lambda ct=check_type, pa=p: _bg(_run_huawei_single, ct, pa, name=f"hw-{ct}"),
-            trigger="interval", hours=h,
+            trigger=CronTrigger(day_of_week=task.cron_day_of_week, hour=task.cron_hour),
             id=f"huawei_{check_type}", name=f"华为云巡检: {check_type}",
         )
-        log.info("定时任务注册: 华为云 %s, 每 %d 小时", check_type, h)
+        log.info("定时任务注册: 华为云 %s, 每周%s %d:00", check_type, task.cron_day_of_week, task.cron_hour)
         job_count += 1
 
     if job_count > 0:
@@ -246,13 +234,15 @@ def api_schedule_status():
     if cfg.schedule.aws_ec2.enabled:
         tasks.append({
             "id": "aws_ec2", "name": "AWS EC2 巡检",
-            "interval_hours": cfg.schedule.aws_ec2.interval_hours,
+            "cron_day_of_week": cfg.schedule.aws_ec2.cron_day_of_week,
+            "cron_hour": cfg.schedule.aws_ec2.cron_hour,
         })
     for ct, t in cfg.schedule.huawei_checks.items():
         if t.enabled:
             tasks.append({
                 "id": f"huawei_{ct}", "name": f"华为云: {ct}",
-                "interval_hours": t.interval_hours,
+                "cron_day_of_week": t.cron_day_of_week,
+                "cron_hour": t.cron_hour,
                 "params": t.params,
             })
 
@@ -261,6 +251,87 @@ def api_schedule_status():
         "run_on_startup": cfg.schedule.run_on_startup,
         "tasks": tasks,
     }
+
+
+# ── 智能对话 API（SSE 流式返回，不推送 Webhook）──
+
+_chat_sessions: dict[str, object] = {}
+
+
+def _sse_event(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+@app.post("/api/chat")
+async def api_chat(request: Request):
+    body = await request.json()
+    message = body.get("message", "").strip()
+    session_id = body.get("session_id", "")
+
+    if not message:
+        return {"error": "message 不能为空"}
+
+    cfg = _app_config
+    if cfg is None:
+        return {"error": "服务未初始化"}
+
+    if not session_id:
+        session_id = str(uuid.uuid4())
+
+    async def event_stream():
+        yield _sse_event("session", {"session_id": session_id})
+
+        try:
+            from claude_agent_sdk import (
+                AssistantMessage,
+                ClaudeSDKClient,
+                ResultMessage,
+                TextBlock,
+                ToolUseBlock,
+            )
+            from cloud_monitor.agent import create_agent_options
+
+            if session_id in _chat_sessions:
+                client = _chat_sessions[session_id]
+            else:
+                options = create_agent_options(cfg)
+                client = ClaudeSDKClient(options=options)
+                await client.__aenter__()
+                _chat_sessions[session_id] = client
+
+            await client.query(message)
+            async for msg in client.receive_response():
+                if isinstance(msg, AssistantMessage):
+                    for block in msg.content:
+                        if isinstance(block, TextBlock):
+                            yield _sse_event("text", {"text": block.text})
+                        elif isinstance(block, ToolUseBlock):
+                            params = {k: v for k, v in (block.input or {}).items()
+                                      if v is not None and v != ""}
+                            yield _sse_event("tool_call", {"name": block.name, "params": params})
+                elif isinstance(msg, ResultMessage):
+                    if msg.total_cost_usd and msg.total_cost_usd > 0:
+                        yield _sse_event("cost", {"cost_usd": msg.total_cost_usd})
+
+            yield _sse_event("done", {})
+        except Exception as e:
+            log.exception("智能对话异常")
+            yield _sse_event("error", {"error": str(e)})
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.post("/api/chat/reset")
+async def api_chat_reset(request: Request):
+    body = await request.json()
+    session_id = body.get("session_id", "")
+    if session_id and session_id in _chat_sessions:
+        client = _chat_sessions.pop(session_id)
+        try:
+            await client.__aexit__(None, None, None)
+        except Exception:
+            pass
+    return {"ok": True}
 
 
 WEB_DIST = Path(__file__).parent.parent / "web" / "dist"

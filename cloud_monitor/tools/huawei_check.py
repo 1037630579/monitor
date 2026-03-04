@@ -779,6 +779,21 @@ ALL_CHECKS = [
 ]
 
 
+def _run_check_single_region(
+    config: HuaweiCloudConfig,
+    check_type: str,
+    check_fn,
+    **kwargs,
+) -> tuple[str, list[dict]]:
+    """对单个区域执行单项巡检"""
+    if check_type == "ecs_idle":
+        return check_fn(config, **kwargs)
+    elif check_type == "cce_node_pods":
+        return check_fn(config, **kwargs)
+    else:
+        return check_fn(config)
+
+
 def run_all_checks(
     config: HuaweiCloudConfig,
     checks: list[str] | None = None,
@@ -786,7 +801,7 @@ def run_all_checks(
     idle_days: int = 10,
     pod_threshold: int = 110,
 ) -> tuple[str, dict[str, list[dict]]]:
-    """运行指定或全部巡检项
+    """运行指定或全部巡检项（自动遍历所有配置的区域）
 
     Args:
         checks: 要运行的巡检类型列表，None=全部
@@ -797,6 +812,7 @@ def run_all_checks(
     Returns:
         (text_report, {check_type: [structured_records]})
     """
+    regions = config.get_regions()
     results_text: list[str] = []
     results_data: dict[str, list[dict]] = {}
 
@@ -804,15 +820,64 @@ def run_all_checks(
         if checks and check_type not in checks:
             continue
 
+        kwargs: dict = {}
         if check_type == "ecs_idle":
-            text, data = check_fn(config, cpu_threshold=cpu_threshold, days=idle_days)
+            kwargs = {"cpu_threshold": cpu_threshold, "days": idle_days}
         elif check_type == "cce_node_pods":
-            text, data = check_fn(config, pod_threshold=pod_threshold)
-        else:
-            text, data = check_fn(config)
+            kwargs = {"pod_threshold": pod_threshold}
 
-        results_text.append(text)
-        results_data[check_type] = data
+        all_data: list[dict] = []
+        all_text: list[str] = []
+
+        for region in regions:
+            region_cfg = config.for_region(region)
+            if not region_cfg.project_id:
+                all_text.append(f"⚠️ 跳过区域 {region}: 未获取到 project_id")
+                continue
+            text, data = _run_check_single_region(region_cfg, check_type, check_fn, **kwargs)
+            all_text.append(text)
+            all_data.extend(data)
+
+        results_text.append("\n".join(all_text))
+        results_data[check_type] = all_data
 
     full_text = "\n\n" + "═" * 60 + "\n\n".join([""] + results_text)
     return full_text, results_data
+
+
+def run_single_check_all_regions(
+    config: HuaweiCloudConfig,
+    check_type: str,
+    params: dict | None = None,
+) -> tuple[str, list[dict]]:
+    """对单个巡检项遍历所有区域执行（供 server.py 定时任务调用）"""
+    check_fn = None
+    for ct, _, fn in ALL_CHECKS:
+        if ct == check_type:
+            check_fn = fn
+            break
+    if check_fn is None:
+        return f"未知的巡检类型: {check_type}", []
+
+    params = params or {}
+    kwargs: dict = {}
+    if check_type == "ecs_idle":
+        kwargs["cpu_threshold"] = float(params.get("cpu_threshold", 5.0))
+        kwargs["days"] = int(params.get("idle_days", 10))
+    elif check_type == "cce_node_pods":
+        kwargs["pod_threshold"] = int(params.get("pod_threshold", 110))
+
+    regions = config.get_regions()
+    all_text: list[str] = []
+    all_data: list[dict] = []
+
+    for region in regions:
+        region_cfg = config.for_region(region)
+        if not region_cfg.project_id:
+            all_text.append(f"⚠️ 跳过区域 {region}: 未获取到 project_id")
+            continue
+        text, data = _run_check_single_region(region_cfg, check_type, check_fn, **kwargs)
+        all_text.append(text)
+        all_data.extend(data)
+
+    return "\n".join(all_text), all_data
