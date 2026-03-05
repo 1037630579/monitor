@@ -99,6 +99,41 @@ def _bg(fn, *args, name="job"):
     threading.Thread(target=fn, args=args, daemon=True, name=name).start()
 
 
+def _run_all_checks_sequential():
+    """按顺序执行所有已启用的巡检任务（AWS → 华为云）"""
+    import time
+    cfg = _app_config
+    if cfg is None:
+        return
+    t_total = time.time()
+    log.info("=" * 60)
+    log.info("[定时巡检] 开始顺序执行所有巡检任务")
+    log.info("=" * 60)
+
+    task_idx = 0
+    for check_type, task in cfg.schedule.aws_checks.items():
+        if not task.enabled or not cfg.aws.enabled:
+            continue
+        task_idx += 1
+        log.info("[定时巡检] (%d) AWS %s 开始", task_idx, check_type)
+        _run_aws_single(check_type, task.params, task.regions or None)
+        log.info("[定时巡检] (%d) AWS %s 完成", task_idx, check_type)
+
+    for group_name, task in cfg.schedule.huawei_checks.items():
+        if not task.enabled or not cfg.huawei.enabled:
+            continue
+        task_idx += 1
+        cts = task.check_types if task.check_types else [group_name]
+        log.info("[定时巡检] (%d) 华为云 %s 开始", task_idx, group_name)
+        _run_huawei_group(group_name, cts, task.params, task.regions or None)
+        log.info("[定时巡检] (%d) 华为云 %s 完成", task_idx, group_name)
+
+    elapsed = time.time() - t_total
+    log.info("=" * 60)
+    log.info("[定时巡检] 全部完成 | 共 %d 项, 总耗时 %.1fs", task_idx, elapsed)
+    log.info("=" * 60)
+
+
 @app.on_event("startup")
 def startup():
     global _app_config
@@ -115,7 +150,8 @@ def startup():
     from apscheduler.triggers.cron import CronTrigger
     scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
 
-    job_count = 0
+    aws_tasks: list[tuple[str, dict, list[str] | None]] = []
+    huawei_tasks: list[tuple[str, list[str], dict, list[str] | None]] = []
 
     for check_type, task in config.schedule.aws_checks.items():
         if not task.enabled:
@@ -123,14 +159,7 @@ def startup():
         if not config.aws.enabled:
             log.warning("AWS 未启用, 跳过巡检: %s", check_type)
             continue
-        p = task.params
-        tr = task.regions or None
-        scheduler.add_job(
-            lambda ct=check_type, pa=p, rg=tr: _bg(_run_aws_single, ct, pa, rg, name=f"aws-{ct}"),
-            trigger=CronTrigger(day_of_week=task.cron_day_of_week, hour=task.cron_hour),
-            id=f"aws_{check_type}", name=f"AWS巡检: {check_type}",
-        )
-        job_count += 1
+        aws_tasks.append((check_type, task.params, task.regions or None))
 
     for group_name, task in config.schedule.huawei_checks.items():
         if not task.enabled:
@@ -138,55 +167,52 @@ def startup():
         if not config.huawei.enabled:
             log.warning("华为云未启用, 跳过巡检: %s", group_name)
             continue
-        p = task.params
-        tr = task.regions or None
         cts = task.check_types if task.check_types else [group_name]
-        job_label = f"{group_name} ({', '.join(cts)})" if len(cts) > 1 else group_name
-        scheduler.add_job(
-            lambda gn=group_name, ct=cts, pa=p, rg=tr: _bg(_run_huawei_group, gn, ct, pa, rg, name=f"hw-{gn}"),
-            trigger=CronTrigger(day_of_week=task.cron_day_of_week, hour=task.cron_hour),
-            id=f"huawei_{group_name}", name=f"华为云巡检: {job_label}",
-        )
-        job_count += 1
+        huawei_tasks.append((group_name, cts, task.params, task.regions or None))
+
+    job_count = len(aws_tasks) + len(huawei_tasks)
 
     if job_count > 0:
+        all_tasks = list(config.schedule.aws_checks.values()) + list(config.schedule.huawei_checks.values())
+        first_enabled = next((t for t in all_tasks if t.enabled), None)
+        cron_dow = first_enabled.cron_day_of_week if first_enabled else "*"
+        cron_h = first_enabled.cron_hour if first_enabled else 2
+        cron_m = first_enabled.cron_minute if first_enabled else 0
+
+        scheduler.add_job(
+            lambda: _bg(_run_all_checks_sequential, name="all-checks"),
+            trigger=CronTrigger(day_of_week=cron_dow, hour=cron_h, minute=cron_m),
+            id="all_checks", name="全部巡检（顺序执行）",
+        )
         scheduler.start()
+
+        job = scheduler.get_job("all_checks")
+        next_run = job.next_run_time.strftime("%Y-%m-%d %H:%M:%S %Z") if job and job.next_run_time else "未知"
+
         log.info("=" * 60)
         log.info("定时任务调度器已启动 (时区: Asia/Shanghai)")
-        log.info("已注册 %d 个定时任务:", job_count)
-        DAY_MAP = {"mon": "周一", "tue": "周二", "wed": "周三", "thu": "周四",
-                   "fri": "周五", "sat": "周六", "sun": "周日"}
-        region_info: dict[str, list[str]] = {}
-        default_aws_regions = config.aws.accounts[0].get_regions() if config.aws.accounts else []
-        for ct, t in config.schedule.aws_checks.items():
-            if t.enabled:
-                effective = t.regions if t.regions else default_aws_regions
-                region_info[f"aws_{ct}"] = effective
-        for gn, t in config.schedule.huawei_checks.items():
-            if t.enabled:
-                effective = t.regions if t.regions else config.huawei.get_regions()
-                region_info[f"huawei_{gn}"] = effective
+        log.info("执行模式: 顺序执行 | 下次执行: %s", next_run)
+        log.info("共 %d 个巡检任务:", job_count)
 
-        for job in scheduler.get_jobs():
-            next_run = job.next_run_time.strftime("%Y-%m-%d %H:%M:%S %Z") if job.next_run_time else "未知"
-            regions = region_info.get(job.id)
-            if regions:
-                log.info("  [%s] %s | 区域(%d): %s | 下次执行: %s", job.id, job.name, len(regions), regions, next_run)
-            else:
-                log.info("  [%s] %s | 下次执行: %s", job.id, job.name, next_run)
+        default_aws_regions = config.aws.accounts[0].get_regions() if config.aws.accounts else []
+        idx = 0
+        for ct, t in config.schedule.aws_checks.items():
+            if t.enabled and config.aws.enabled:
+                idx += 1
+                effective = t.regions if t.regions else default_aws_regions
+                log.info("  %d. [aws_%s] AWS巡检: %s | 区域(%d): %s", idx, ct, ct, len(effective), effective)
+        for gn, t in config.schedule.huawei_checks.items():
+            if t.enabled and config.huawei.enabled:
+                idx += 1
+                effective = t.regions if t.regions else config.huawei.get_regions()
+                cts = t.check_types if t.check_types else [gn]
+                label = f"{gn} ({', '.join(cts)})" if len(cts) > 1 else gn
+                log.info("  %d. [huawei_%s] 华为云巡检: %s | 区域(%d): %s", idx, gn, label, len(effective), effective)
         log.info("=" * 60)
 
         if config.schedule.run_on_startup:
-            log.info("服务启动: 立即执行首次巡检")
-            for check_type, task in config.schedule.aws_checks.items():
-                if task.enabled and config.aws.enabled:
-                    tr = task.regions or None
-                    _bg(_run_aws_single, check_type, task.params, tr, name=f"aws-{check_type}-startup")
-            for group_name, task in config.schedule.huawei_checks.items():
-                if task.enabled and config.huawei.enabled:
-                    tr = task.regions or None
-                    cts = task.check_types if task.check_types else [group_name]
-                    _bg(_run_huawei_group, group_name, cts, task.params, tr, name=f"hw-{group_name}-startup")
+            log.info("服务启动: 立即顺序执行首次巡检")
+            _bg(_run_all_checks_sequential, name="all-checks-startup")
 
 
 # ── AWS 巡检 API ──

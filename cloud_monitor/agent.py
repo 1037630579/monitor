@@ -85,7 +85,7 @@ def build_tools(config: AppConfig) -> list:
         hw_cfg = config.huawei
 
         HUAWEI_RESOURCE_GROUPS: dict[str, list[str]] = {
-            "ecs": ["ecs_security_group", "ecs_idle"],
+            "ecs": ["ecs_security_group", "ecs_anti_affinity", "ecs_idle"],
             "rds": ["rds_ha", "rds_network_type", "rds_params_double_one"],
             "cce": ["cce_workload_replica", "cce_node_pods"],
             "dds": ["dds_network_type"],
@@ -111,7 +111,7 @@ def build_tools(config: AppConfig) -> list:
                     pass
             return {"content": [{"type": "text", "text": "\n\n".join(all_text)}]}
 
-        @tool("huawei_ecs", "华为云 ECS 巡检：安全组规则检查 + 闲置实例检查，一次返回全部结果", {})
+        @tool("huawei_ecs", "华为云 ECS 巡检：安全组规则检查 + 反亲和性检查 + 闲置实例检查，一次返回全部结果", {})
         async def huawei_ecs_tool(args: dict[str, Any]) -> dict[str, Any]:
             return _run_huawei_group("ecs", HUAWEI_RESOURCE_GROUPS["ecs"])
 
@@ -308,7 +308,7 @@ SYSTEM_PROMPT = """\
 # 华为云巡检
 
 每个工具一次调用返回该资源的全部巡检结果：
-- huawei_ecs: 安全组规则 + 闲置实例
+- huawei_ecs: 安全组规则 + 反亲和性 + 闲置实例
 - huawei_rds: 高可用部署 + 网络类型 + 参数双1
 - huawei_cce: 工作负载副本数 + 节点 Pod 数量
 - huawei_dds: 网络类型

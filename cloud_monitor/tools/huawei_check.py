@@ -202,6 +202,100 @@ def check_ecs_security_groups(config: HuaweiCloudConfig) -> tuple[str, list[dict
 
 
 # ─────────────────────────────────────────────────────────────────────
+# 巡检1b: ECS 反亲和性检查
+# ─────────────────────────────────────────────────────────────────────
+
+def _extract_biz_prefix(name: str) -> str:
+    """从 ECS 名称中提取业务前缀，去掉尾部数字编号（如 -0001、_02、-3）"""
+    import re
+    prefix = re.sub(r'[-_]?\d+$', '', name)
+    return prefix if prefix else name
+
+
+def check_ecs_anti_affinity(config: HuaweiCloudConfig) -> tuple[str, list[dict]]:
+    """按名称前缀分组识别相同业务，只对多实例业务组中未设反亲和的告警"""
+    try:
+        ecs = _ecs_client(config)
+        from huaweicloudsdkecs.v2.model import ListServerGroupsRequest, ListServersDetailsRequest
+        from collections import defaultdict
+
+        sg_resp = ecs.list_server_groups(ListServerGroupsRequest(limit=200))
+        server_groups = sg_resp.server_groups or []
+
+        grouped_ids: set[str] = set()
+        for sg in server_groups:
+            if "anti-affinity" in (sg.policies or []):
+                for mid in (sg.members or []):
+                    grouped_ids.add(mid)
+
+        all_servers: list = []
+        offset = 0
+        while True:
+            inst_resp = ecs.list_servers_details(ListServersDetailsRequest(limit=200, offset=offset))
+            batch = inst_resp.servers or []
+            all_servers.extend(batch)
+            if len(batch) < 200:
+                break
+            offset += 200
+
+        active_servers = [s for s in all_servers
+                          if (getattr(s, "status", "") or "") not in ("DELETED", "SOFT_DELETED")]
+
+        biz_groups: dict[str, list[dict]] = defaultdict(list)
+        for s in active_servers:
+            prefix = _extract_biz_prefix(s.name or "")
+            biz_groups[prefix].append({
+                "id": s.id, "name": s.name or "",
+                "in_group": s.id in grouped_ids,
+            })
+
+        multi_groups = {k: v for k, v in biz_groups.items() if len(v) >= 2}
+        risky_groups: list[tuple[str, int, int, list[dict]]] = []
+        compliant_count = 0
+
+        for prefix, members in sorted(multi_groups.items(), key=lambda x: -len(x[1])):
+            in_cnt = sum(1 for m in members if m["in_group"])
+            not_in = [m for m in members if not m["in_group"]]
+            if not_in:
+                risky_groups.append((prefix, len(members), in_cnt, not_in))
+            else:
+                compliant_count += 1
+
+        total_multi = len(multi_groups)
+        compliance = (compliant_count / total_multi * 100) if total_multi > 0 else 100
+
+        lines = [f"📋 ECS 反亲和性检查 [区域: {config.region}]"]
+        lines.append(f"  ECS 实例总数: {len(active_servers)}, 多实例业务组: {total_multi}, 反亲和合规组: {compliant_count}")
+        lines.append(f"  业务组合规率: {compliance:.0f}%（{total_multi}组中{compliant_count}组已全部配置）")
+
+        risky: list[dict] = []
+        if risky_groups:
+            lines.append(f"\n⚠️ 未配置反亲和的业务组 ({len(risky_groups)} 组):")
+            for prefix, total, in_cnt, not_in_members in risky_groups:
+                lines.append(f"  ⚠️ {prefix} ({total}台, {in_cnt}台已配置)")
+                not_in_names = [m["name"] for m in not_in_members]
+                for rec_member in not_in_members:
+                    risky.append(_make_record(
+                        check_type="ecs_anti_affinity",
+                        risk_level="medium",
+                        resource_type="ECS",
+                        resource_id=rec_member["id"],
+                        resource_name=rec_member["name"],
+                        region=config.region,
+                        detail=f"相同业务 {prefix} 共{total}台, 未设置主机级反亲和性",
+                        extra={"biz_group": prefix, "group_total": total,
+                               "group_configured": in_cnt,
+                               "unconfigured_instances": not_in_names},
+                    ))
+        else:
+            lines.append(f"\n✅ 所有多实例业务组均已配置反亲和")
+
+        return "\n".join(lines), risky
+    except Exception as e:
+        return f"ECS 反亲和性检查失败: {e}\n{traceback.format_exc()}", []
+
+
+# ─────────────────────────────────────────────────────────────────────
 # 巡检2: CCE 工作负载副本数检查
 # ─────────────────────────────────────────────────────────────────────
 
@@ -706,8 +800,8 @@ def check_cce_node_pods(config: HuaweiCloudConfig, pod_threshold: int = 110) -> 
 
 def check_ecs_idle(
     config: HuaweiCloudConfig,
-    cpu_threshold: float = 5.0,
-    days: int = 10,
+    cpu_threshold: float = 10.0,
+    days: int = 15,
 ) -> tuple[str, list[dict]]:
     """检查 ECS 实例 CPU 利用率 — 过去 N 天平均和最高 CPU 是否低于阈值"""
     try:
@@ -788,6 +882,7 @@ def check_ecs_idle(
 
 ALL_CHECKS = [
     ("ecs_security_group", "ECS安全组规则检查", check_ecs_security_groups),
+    ("ecs_anti_affinity", "ECS反亲和性检查", check_ecs_anti_affinity),
     ("cce_workload_replica", "CCE工作负载副本数检查", check_cce_workload_replicas),
     ("rds_ha", "RDS高可用部署检查", check_rds_ha),
     ("dms_rabbitmq_cluster", "DMS RabbitMQ集群部署检查", check_dms_rabbitmq_cluster),

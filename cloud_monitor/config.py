@@ -119,6 +119,7 @@ class TaskSchedule:
     enabled: bool = True
     cron_day_of_week: str = "mon"
     cron_hour: int = 2
+    cron_minute: int = 0
     regions: list[str] = field(default_factory=list)
     check_types: list[str] = field(default_factory=list)
     params: dict = field(default_factory=dict)
@@ -251,7 +252,7 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
                 tasks: dict[str, TaskSchedule] = {}
                 for check_type, check_cfg in section.items():
                     if isinstance(check_cfg, dict):
-                        reserved_keys = {"enabled", "cron_day_of_week", "cron_hour", "regions", "check_types"}
+                        reserved_keys = {"enabled", "cron_day_of_week", "cron_hour", "cron_minute", "regions", "check_types"}
                         params = {k: v for k, v in check_cfg.items()
                                   if k not in reserved_keys}
                         task_regions = check_cfg.get("regions", [])
@@ -264,6 +265,7 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
                             enabled=check_cfg.get("enabled", True),
                             cron_day_of_week=str(check_cfg.get("cron_day_of_week", "mon")),
                             cron_hour=int(check_cfg.get("cron_hour", 2)),
+                            cron_minute=int(check_cfg.get("cron_minute", 0)),
                             regions=task_regions,
                             check_types=check_types,
                             params=params,
