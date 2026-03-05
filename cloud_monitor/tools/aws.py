@@ -214,27 +214,29 @@ def get_metric_data_aws(
 
 # ──────────────── VPN 工具 ────────────────
 
-def list_vpn_connections_aws(config: AWSAccountConfig) -> str:
-    """列出 AWS VPN 连接，并自动查询每个 VPN 最近1小时每1分钟的带宽数据"""
+def list_vpn_connections_aws(config: AWSAccountConfig, region: str = "") -> str:
+    """列出 AWS VPN 连接，并自动查询每个 VPN 最近1小时每1分钟的带宽数据。
+    region 为空时遍历 config.get_regions()；指定单个区域则只查该区域。"""
     label = _account_label(config)
-    try:
-        region = config.get_vpn_region()
-        client = _get_client(config, service="ec2", region=region)
-        response = client.describe_vpn_connections()
-        vpns = response.get("VpnConnections", [])
+    regions = [region] if region else config.get_regions()
+    all_results = []
+    for r in regions:
+        try:
+            client = _get_client(config, service="ec2", region=r)
+            response = client.describe_vpn_connections()
+            vpns = response.get("VpnConnections", [])
+            if not vpns:
+                continue
+            for vpn in vpns:
+                vpn_id = vpn["VpnConnectionId"]
+                detail = get_vpn_status_aws(config, vpn_id=vpn_id, hours=1, period=60, region=r)
+                all_results.append(detail)
+        except Exception as e:
+            all_results.append(f"{label}AWS 区域 {r} 查询 VPN 失败: {e}")
 
-        if not vpns:
-            return f"{label}AWS 区域 {region} 无 VPN 连接"
-
-        results = []
-        for vpn in vpns:
-            vpn_id = vpn["VpnConnectionId"]
-            detail = get_vpn_status_aws(config, vpn_id=vpn_id, hours=1, period=60)
-            results.append(detail)
-
-        return f"{label}在区域 {region} 找到 {len(vpns)} 个 VPN 连接:\n\n" + "\n\n".join(results)
-    except Exception as e:
-        return f"{label}AWS 查询 VPN 连接失败: {e}\n{traceback.format_exc()}"
+    if not all_results:
+        return f"{label}AWS 在 {len(regions)} 个区域中无 VPN 连接"
+    return f"{label}共找到 {len(all_results)} 个 VPN 连接（扫描 {len(regions)} 个区域）:\n\n" + "\n\n".join(all_results)
 
 
 def _format_bytes(value: float) -> str:
@@ -260,11 +262,11 @@ def _format_rate(bytes_per_sec: float) -> str:
     return f"{bits_per_sec:.0f} b/s"
 
 
-def get_vpn_status_aws(config: AWSAccountConfig, vpn_id: str = "", hours: float = 1, period: int = 60) -> str:
+def get_vpn_status_aws(config: AWSAccountConfig, vpn_id: str = "", hours: float = 1, period: int = 60, region: str = "") -> str:
     """查询 AWS VPN 带宽使用情况：最新采样点 + 时间趋势表格 + 小结"""
     label = _account_label(config)
     try:
-        region = config.get_vpn_region()
+        region = region or config.get_vpn_region()
         ec2 = _get_client(config, service="ec2", region=region)
         cw = _get_client(config, region=region)
 
@@ -855,14 +857,15 @@ def list_cloudfront_distributions_aws(config: AWSAccountConfig, status_filter: s
 
 # ──────────────── ALB ────────────────
 
-def list_elb_aws(config: AWSAccountConfig) -> str:
-    """列出 AWS ALB 负载均衡器"""
+def list_elb_aws(config: AWSAccountConfig, region: str = "") -> str:
+    """列出 AWS ALB 负载均衡器。
+    region 为空时遍历 config.get_regions()；指定单个区域则只查该区域。"""
     label = _account_label(config)
-    try:
-        region = config.get_elb_region()
-        results = []
+    regions = [region] if region else config.get_regions()
+    all_results = []
+    for r in regions:
         try:
-            elbv2_client = _get_client(config, service="elbv2", region=region)
+            elbv2_client = _get_client(config, service="elbv2", region=r)
             resp = elbv2_client.describe_load_balancers()
 
             alb_list = [lb for lb in resp.get("LoadBalancers", []) if lb.get("Type") == "application"]
@@ -896,23 +899,21 @@ def list_elb_aws(config: AWSAccountConfig) -> str:
                     instance_name=lb.get("LoadBalancerName", ""),
                     instance_type="ALB",
                     status=lb.get("State", {}).get("Code", ""),
-                    region=region,
+                    region=r,
                     extra={
                         "DNS": lb.get("DNSName", ""),
                         "ARN": arn,
                         "Scheme": lb.get("Scheme", ""),
                     },
                 )
-                results.append(info.display())
+                all_results.append(info.display())
         except Exception:
             pass
 
-        if not results:
-            return f"{label}AWS 区域 {region} 无负载均衡器"
+    if not all_results:
+        return f"{label}AWS 在 {len(regions)} 个区域中无负载均衡器"
 
-        return f"{label}在区域 {region} 找到 {len(results)} 个负载均衡器:\n\n" + "\n\n".join(results)
-    except Exception as e:
-        return f"{label}AWS 查询负载均衡器失败: {e}\n{traceback.format_exc()}"
+    return f"{label}共找到 {len(all_results)} 个负载均衡器（扫描 {len(regions)} 个区域）:\n\n" + "\n\n".join(all_results)
 
 
 # ──────────────── 统一巡检入口（供定时任务调用）────────────────
@@ -967,24 +968,14 @@ def run_single_aws_check(
     elif check_type == "vpn":
         all_text = []
         for region in regions:
-            cfg_copy = AWSAccountConfig(
-                name=config.name, access_key_id=config.access_key_id,
-                secret_access_key=config.secret_access_key,
-                region=region, vpn_region=region,
-            )
-            text = list_vpn_connections_aws(cfg_copy)
+            text = list_vpn_connections_aws(config, region=region)
             all_text.append(text)
         return "\n\n".join(all_text), []
 
     elif check_type == "elb":
         all_text = []
         for region in regions:
-            cfg_copy = AWSAccountConfig(
-                name=config.name, access_key_id=config.access_key_id,
-                secret_access_key=config.secret_access_key,
-                region=region, elb_region=region,
-            )
-            text = list_elb_aws(cfg_copy)
+            text = list_elb_aws(config, region=region)
             all_text.append(text)
         return "\n\n".join(all_text), []
 

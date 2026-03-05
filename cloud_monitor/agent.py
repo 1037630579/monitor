@@ -209,25 +209,27 @@ def build_tools(config: AppConfig) -> list:
             return {"content": [{"type": "text", "text": result}]}
 
         # ── VPN ──
-        @tool("aws_list_vpn", "列出 AWS VPN 连接并自动查询每个VPN最近1小时的带宽数据（1分钟粒度表格）。account: 账户名(空=所有账户)", {"account": str})
+        @tool("aws_list_vpn", "列出 AWS VPN 连接并自动查询每个VPN最近1小时的带宽数据（1分钟粒度表格）。自动扫描所有配置区域。account: 账户名(空=所有账户)。region: 指定区域(空=所有区域)", {"account": str, "region": str})
         async def aws_list_vpn_tool(args: dict[str, Any]) -> dict[str, Any]:
-            result = _run_for_accounts(args.get("account", ""), list_vpn_connections_aws)
+            result = _run_for_accounts(args.get("account", ""), list_vpn_connections_aws,
+                                       region=args.get("region", ""))
             return {"content": [{"type": "text", "text": result}]}
 
         @tool(
             "aws_vpn_status",
-            "查询 AWS VPN 带宽使用情况：隧道状态 + 最新采样点 + 每分钟带宽趋势表格(Mbps) + 小结。默认最近1小时、每1分钟一个点(hours=1, period=60)。account: 账户名(空=默认)。vpn_id: 可选指定VPN",
-            {"account": str, "vpn_id": str, "hours": float, "period": int},
+            "查询 AWS VPN 带宽使用情况：隧道状态 + 最新采样点 + 每分钟带宽趋势表格(Mbps) + 小结。默认最近1小时、每1分钟一个点(hours=1, period=60)。account: 账户名(空=默认)。vpn_id: 可选指定VPN。region: 指定区域(空=默认)",
+            {"account": str, "vpn_id": str, "hours": float, "period": int, "region": str},
         )
         async def aws_vpn_status_tool(args: dict[str, Any]) -> dict[str, Any]:
             acc = aws_cfg.get_account(args.get("account", ""))
-            result = get_vpn_status_aws(acc, vpn_id=args.get("vpn_id", ""), hours=args.get("hours", 1), period=args.get("period", 60))
+            result = get_vpn_status_aws(acc, vpn_id=args.get("vpn_id", ""), hours=args.get("hours", 1), period=args.get("period", 60), region=args.get("region", ""))
             return {"content": [{"type": "text", "text": result}]}
 
         # ── ALB 负载均衡 ──
-        @tool("aws_list_elb", "列出 AWS ALB 负载均衡器。account: 账户名(空=所有账户)", {"account": str})
+        @tool("aws_list_elb", "列出 AWS ALB 负载均衡器。自动扫描所有配置区域。account: 账户名(空=所有账户)。region: 指定区域(空=所有区域)", {"account": str, "region": str})
         async def aws_list_elb_tool(args: dict[str, Any]) -> dict[str, Any]:
-            result = _run_for_accounts(args.get("account", ""), list_elb_aws)
+            result = _run_for_accounts(args.get("account", ""), list_elb_aws,
+                                       region=args.get("region", ""))
             return {"content": [{"type": "text", "text": result}]}
 
         # ── CloudFront CDN ──
@@ -308,11 +310,11 @@ SYSTEM_PROMPT = """\
 
 # AWS 工具
 
-- aws_ec2: EC2 统一查询（概览 + 已停止 + 低利用率），不传参数即可
-- aws_list_s3: S3 存储桶列表
-- aws_list_vpn / aws_vpn_status: VPN 连接和带宽详情
-- aws_list_elb: ALB 负载均衡器列表
-- aws_list_cloudfront: CloudFront CDN 分发概览
+- aws_ec2: EC2 统一查询（概览 + 已停止 + 低利用率），自动扫描所有区域
+- aws_list_s3: S3 存储桶列表，自动扫描所有区域
+- aws_list_vpn / aws_vpn_status: VPN 连接和带宽详情，自动扫描所有区域
+- aws_list_elb: ALB 负载均衡器列表，自动扫描所有区域
+- aws_list_cloudfront: CloudFront CDN 分发概览（全局服务）
 
 # 查询决策
 
@@ -333,6 +335,7 @@ SYSTEM_PROMPT = """\
 # 多账户与多区域
 
 - 每个 AWS 工具都有 account 参数，不传 = 查询所有账户
+- AWS 的 EC2、S3、VPN、ELB 都支持 region 参数，不传 = 自动扫描所有配置区域
 - 华为云巡检自动遍历配置的所有区域
 
 # 输出规范
