@@ -42,6 +42,17 @@ def _vpc_client(config: HuaweiCloudConfig):
     )
 
 
+def _vpc_v3_client(config: HuaweiCloudConfig):
+    from huaweicloudsdkvpc.v3 import VpcClient as VpcV3Client
+    from huaweicloudsdkvpc.v3.region.vpc_region import VpcRegion as VpcV3Region
+    return (
+        VpcV3Client.new_builder()
+        .with_credentials(_basic_creds(config))
+        .with_region(VpcV3Region.value_of(config.region))
+        .build()
+    )
+
+
 def _rds_client(config: HuaweiCloudConfig):
     from huaweicloudsdkrds.v3 import RdsClient
     from huaweicloudsdkrds.v3.region.rds_region import RdsRegion
@@ -128,12 +139,12 @@ def _make_record(
 # ─────────────────────────────────────────────────────────────────────
 
 def check_ecs_security_groups(config: HuaweiCloudConfig) -> tuple[str, list[dict]]:
-    """检查 ECS 安全组规则 — 检测未设置主机组/规则过于宽松(0.0.0.0/0)的安全组"""
+    """检查 ECS 安全组规则 — 仅当规则状态开启(action=allow)且入站源为0.0.0.0/0时才算高危"""
     try:
-        vpc = _vpc_client(config)
-        from huaweicloudsdkvpc.v2.model import ListSecurityGroupsRequest, ListSecurityGroupRulesRequest
+        vpc_v3 = _vpc_v3_client(config)
+        from huaweicloudsdkvpc.v3.model import ListSecurityGroupsRequest, ListSecurityGroupRulesRequest
 
-        sg_resp = vpc.list_security_groups(ListSecurityGroupsRequest(limit=200))
+        sg_resp = vpc_v3.list_security_groups(ListSecurityGroupsRequest(limit=2000))
         groups = sg_resp.security_groups or []
 
         risky: list[dict] = []
@@ -144,20 +155,25 @@ def check_ecs_security_groups(config: HuaweiCloudConfig) -> tuple[str, list[dict
         for sg in groups:
             sg_id = sg.id
             sg_name = sg.name or ""
-            rules = sg.security_group_rules or []
+
+            rules_resp = vpc_v3.list_security_group_rules(
+                ListSecurityGroupRulesRequest(security_group_id=[sg_id], limit=200)
+            )
+            rules = rules_resp.security_group_rules or []
 
             risky_rules: list[str] = []
             for r in rules:
-                direction = r.direction or ""
-                remote_ip = r.remote_ip_prefix or ""
-                protocol = r.protocol or "any"
-                port_min = getattr(r, "port_range_min", None)
-                port_max = getattr(r, "port_range_max", None)
+                direction = getattr(r, "direction", "") or ""
+                remote_ip = getattr(r, "remote_ip_prefix", "") or ""
+                protocol = getattr(r, "protocol", "") or "any"
+                action = getattr(r, "action", "allow") or "allow"
+                multiport = getattr(r, "multiport", "") or ""
+
+                if action.lower() == "deny":
+                    continue
 
                 if direction == "ingress" and remote_ip in ("0.0.0.0/0", "::/0"):
-                    port_desc = "全端口"
-                    if port_min and port_max:
-                        port_desc = f"{port_min}-{port_max}" if port_min != port_max else str(port_min)
+                    port_desc = multiport if multiport else "全端口"
                     risky_rules.append(f"入站 {protocol} {port_desc} 开放 {remote_ip}")
 
             if risky_rules:
@@ -385,8 +401,9 @@ def check_dms_rabbitmq_cluster(config: HuaweiCloudConfig) -> tuple[str, list[dic
         resp = dms.list_instances_details(ListInstancesDetailsRequest())
         instances = resp.instances or []
 
+        total = len(instances)
         lines = [f"📋 DMS RabbitMQ 集群部署检查 [区域: {config.region}]"]
-        lines.append(f"  RabbitMQ 实例总数: {len(instances)}")
+        lines.append(f"  RabbitMQ 实例总数: {total}")
         risky: list[dict] = []
 
         for inst in instances:
@@ -403,7 +420,7 @@ def check_dms_rabbitmq_cluster(config: HuaweiCloudConfig) -> tuple[str, list[dic
                 is_single = True
 
             if is_single:
-                detail = f"节点数: {node_num or '未知'}, 规格: {spec_code}, 版本: {engine_version}"
+                detail = f"单节点部署, 无高可用能力 | 规格: {spec_code} × {node_num or 1} broker, 版本: {engine_version}"
                 lines.append(f"  ⚠️ {inst_name} ({inst_id}): {detail}")
                 risky.append(_make_record(
                     check_type="dms_rabbitmq_cluster",
@@ -416,10 +433,13 @@ def check_dms_rabbitmq_cluster(config: HuaweiCloudConfig) -> tuple[str, list[dic
                     extra={"node_num": node_num, "spec_code": spec_code, "engine_version": engine_version},
                 ))
 
+        cluster_count = total - len(risky)
+        compliance_rate = (cluster_count / total * 100) if total > 0 else 100
         if not risky:
-            lines.append(f"\n✅ 所有 RabbitMQ 实例均为集群部署")
+            lines.append(f"\n✅ 所有 RabbitMQ 实例均为集群部署（合规率 100%）")
         else:
-            lines.insert(2, f"  ⚠️ 非集群实例: {len(risky)} 个")
+            lines.insert(2, f"  集群部署合规率: {compliance_rate:.0f}%（{total}个实例中{cluster_count}个为集群部署）")
+            lines.insert(3, f"  ⚠️ 非集群(单节点)实例: {len(risky)} 个")
 
         return "\n".join(lines), risky
     except Exception as e:
@@ -579,9 +599,9 @@ def check_rds_params(config: HuaweiCloudConfig) -> tuple[str, list[dict]]:
             inst_name = inst.name or ""
 
             try:
-                from huaweicloudsdkrds.v3.model import ListInstanceParamGroupRequest
-                param_resp = rds.list_instance_param_group(
-                    ListInstanceParamGroupRequest(instance_id=inst_id)
+                from huaweicloudsdkrds.v3.model import ShowInstanceConfigurationRequest
+                param_resp = rds.show_instance_configuration(
+                    ShowInstanceConfigurationRequest(instance_id=inst_id)
                 )
                 params_list = getattr(param_resp, "configuration_parameters", []) or []
 

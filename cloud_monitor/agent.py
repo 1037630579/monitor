@@ -92,10 +92,16 @@ def build_tools(config: AppConfig) -> list:
             "dms": ["dms_rabbitmq_cluster"],
         }
 
-        def _run_huawei_group(check_types: list[str]) -> dict[str, Any]:
+        huawei_task_regions: dict[str, list[str]] = {}
+        for gn, task in config.schedule.huawei_checks.items():
+            if task.regions:
+                huawei_task_regions[gn] = task.regions
+
+        def _run_huawei_group(group_name: str, check_types: list[str]) -> dict[str, Any]:
+            task_regions = huawei_task_regions.get(group_name) or None
             all_text: list[str] = []
             for ct in check_types:
-                text, data = run_single_check_all_regions(hw_cfg, ct)
+                text, data = run_single_check_all_regions(hw_cfg, ct, task_regions=task_regions)
                 all_text.append(text)
                 try:
                     from cloud_monitor.db import save_check_results, get_db
@@ -107,23 +113,23 @@ def build_tools(config: AppConfig) -> list:
 
         @tool("huawei_ecs", "华为云 ECS 巡检：安全组规则检查 + 闲置实例检查，一次返回全部结果", {})
         async def huawei_ecs_tool(args: dict[str, Any]) -> dict[str, Any]:
-            return _run_huawei_group(HUAWEI_RESOURCE_GROUPS["ecs"])
+            return _run_huawei_group("ecs", HUAWEI_RESOURCE_GROUPS["ecs"])
 
         @tool("huawei_rds", "华为云 RDS 巡检：高可用部署检查 + 网络类型检查 + 参数双1检查，一次返回全部结果", {})
         async def huawei_rds_tool(args: dict[str, Any]) -> dict[str, Any]:
-            return _run_huawei_group(HUAWEI_RESOURCE_GROUPS["rds"])
+            return _run_huawei_group("rds", HUAWEI_RESOURCE_GROUPS["rds"])
 
         @tool("huawei_cce", "华为云 CCE 巡检：工作负载副本数检查 + 节点 Pod 数量检查，一次返回全部结果", {})
         async def huawei_cce_tool(args: dict[str, Any]) -> dict[str, Any]:
-            return _run_huawei_group(HUAWEI_RESOURCE_GROUPS["cce"])
+            return _run_huawei_group("cce", HUAWEI_RESOURCE_GROUPS["cce"])
 
         @tool("huawei_dds", "华为云 DDS (MongoDB) 巡检：网络类型检查", {})
         async def huawei_dds_tool(args: dict[str, Any]) -> dict[str, Any]:
-            return _run_huawei_group(HUAWEI_RESOURCE_GROUPS["dds"])
+            return _run_huawei_group("dds", HUAWEI_RESOURCE_GROUPS["dds"])
 
         @tool("huawei_dms", "华为云 DMS 巡检：RabbitMQ 集群部署检查", {})
         async def huawei_dms_tool(args: dict[str, Any]) -> dict[str, Any]:
-            return _run_huawei_group(HUAWEI_RESOURCE_GROUPS["dms"])
+            return _run_huawei_group("dms", HUAWEI_RESOURCE_GROUPS["dms"])
 
         @tool("huawei_list_regions", "列出华为云已配置的所有巡检区域及对应的 project_id", {})
         async def huawei_list_regions_tool(args: dict[str, Any]) -> dict[str, Any]:

@@ -310,8 +310,15 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
         cfg.webhook.url = v
         cfg.webhook.enabled = True
 
-    if cfg.huawei.enabled and cfg.huawei.ak and cfg.huawei.get_regions():
-        cfg.huawei.region_projects = _fetch_huawei_region_projects(cfg.huawei)
+    if cfg.huawei.enabled and cfg.huawei.ak:
+        if not cfg.huawei.regions and cfg.schedule.huawei_checks:
+            all_regions: set[str] = set()
+            for task in cfg.schedule.huawei_checks.values():
+                all_regions.update(task.regions)
+            if all_regions:
+                cfg.huawei.regions = sorted(all_regions)
+        if cfg.huawei.get_regions():
+            cfg.huawei.region_projects = _fetch_huawei_region_projects(cfg.huawei)
 
     return cfg
 
